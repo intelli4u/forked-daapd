@@ -57,6 +57,8 @@ typedef void (*player_status_handler)(void);
 
 struct player_source;
 
+int
+player_is_playing(void);
 
 int
 player_get_current_pos(uint64_t *pos, struct timespec *ts, int commit);

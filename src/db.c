@@ -468,7 +468,7 @@ static int
 db_wait_unlock(void)
 {
   struct db_unlock u;
-  int ret;
+  int ret=SQLITE_OK;
 
   u.proceed = 0;
   pthread_mutex_init(&u.lck, NULL);
@@ -1145,16 +1145,22 @@ db_build_query_browse(struct query_params *qp, char *field, char **q)
 
   if (idx && qp->filter)
     query = sqlite3_mprintf("SELECT DISTINCT f.%s, f.%s FROM files f WHERE f.data_kind = 0 AND f.disabled = 0 AND f.%s != ''"
-			    " AND %s %s;", field, field, field, qp->filter, idx);
-  else if (idx)
+//			    " AND %s %s;", field, field, field, qp->filter, idx);
+			    " AND %s ORDER BY f.%s %s;", field, field, field, qp->filter, field, idx);
+else if (idx)
     query = sqlite3_mprintf("SELECT DISTINCT f.%s, f.%s FROM files f WHERE f.data_kind = 0 AND f.disabled = 0 AND f.%s != ''"
-			    " %s;", field, field, field, idx);
+//			    " %s;", field, field, field, idx);
+			    " ORDER BY f.%s %s;", field, field, field, field, idx);
   else if (qp->filter)
     query = sqlite3_mprintf("SELECT DISTINCT f.%s, f.%s FROM files f WHERE f.data_kind = 0 AND f.disabled = 0 AND f.%s != ''"
-			    " AND %s;", field, field, field, qp->filter);
+//			    " AND %s;", field, field, field, qp->filter);
+			    " AND %s ORDER BY f.%s;", field, field, field, qp->filter, field);
+			    
   else
-    query = sqlite3_mprintf("SELECT DISTINCT f.%s, f.%s FROM files f WHERE f.data_kind = 0 AND f.disabled = 0 AND f.%s != ''",
-			    field, field, field);
+//    query = sqlite3_mprintf("SELECT DISTINCT f.%s, f.%s FROM files f WHERE f.data_kind = 0 AND f.disabled = 0 AND f.%s != ''",
+//			    field, field, field);
+    query = sqlite3_mprintf("SELECT DISTINCT f.%s, f.%s FROM files f WHERE f.data_kind = 0 AND f.disabled = 0 AND f.%s != '' ORDER BY f.%s",
+			    field, field, field, field);
 
   if (!query)
     {
@@ -3805,7 +3811,7 @@ db_perthread_init(void)
     }
 
   errmsg = NULL;
-  ret = sqlite3_load_extension(hdl, PKGLIBDIR "/forked-daapd-sqlext.so", NULL, &errmsg);
+  ret = sqlite3_load_extension(hdl, PKGLIBDIR "/libforked-daapd-sqlext.so", NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       if (errmsg)
@@ -4820,7 +4826,6 @@ db_init(void)
   int ret;
 
   db_path = cfg_getstr(cfg_getsec(cfg, "general"), "db_path");
-
   ret = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
   if (ret != SQLITE_OK)
     {

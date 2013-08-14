@@ -46,6 +46,9 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <time.h>
+#include <semaphore.h>
+
+sem_t sem;
 
 #if defined(__linux__) || defined(__GLIBC__)
 # include <endian.h>
@@ -95,6 +98,9 @@ struct raop_v2_packet
   struct raop_v2_packet *prev;
   struct raop_v2_packet *next;
 };
+
+struct raop_v2_packet pkt_array[RETRANSMIT_BUFFER_SIZE+1];
+int pkt_idx;
 
 struct raop_session
 {
@@ -1708,12 +1714,17 @@ raop_session_cleanup(struct raop_session *rs)
   /* No more active sessions, free retransmit buffer */
   if (!sessions)
     {
+      sem_wait(&sem);
       for (pkt = pktbuf_head; pkt; pkt = pkt->next)
-	free(pkt);
+      {
+//	free(pkt);
+       pktbuf_size--;
 
+    }
       pktbuf_head = NULL;
       pktbuf_tail = NULL;
       pktbuf_size = 0;
+      sem_post(&sem);
     }
 }
 
@@ -3049,15 +3060,19 @@ raop_v2_new_packet(void)
 
   if (pktbuf_size >= RETRANSMIT_BUFFER_SIZE)
     {
+      sem_wait(&sem);
+
       pktbuf_size--;
 
       pkt = pktbuf_tail;
 
       pktbuf_tail = pktbuf_tail->prev;
       pktbuf_tail->next = NULL;
+      sem_post(&sem);
     }
   else
     {
+/*
       pkt = (struct raop_v2_packet *)malloc(sizeof(struct raop_v2_packet));
       if (!pkt)
 	{
@@ -3065,6 +3080,12 @@ raop_v2_new_packet(void)
 
 	  return NULL;
 	}
+*/
+      pkt=&pkt_array[pkt_idx];	
+      pkt_idx++;
+      if(pkt_idx>RETRANSMIT_BUFFER_SIZE)
+      	pkt_idx=0;
+      
     }
 
   return pkt;
@@ -3121,7 +3142,7 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not reset AES cipher: %s\n", ebuf);
 
-      free(pkt);
+//      free(pkt);
       return NULL;
     }
 
@@ -3132,7 +3153,7 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not set AES IV: %s\n", ebuf);
 
-      free(pkt);
+//      free(pkt);
       return NULL;
     }
 
@@ -3145,9 +3166,10 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not encrypt payload: %s\n", ebuf);
 
-      free(pkt);
+//      free(pkt);
       return NULL;
     }
+  sem_wait(&sem);
 
   pkt->prev = NULL;
   pkt->next = pktbuf_head;
@@ -3161,6 +3183,7 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
   pktbuf_head = pkt;
 
   pktbuf_size++;
+      sem_post(&sem);
 
   return pkt;
 }
@@ -3241,20 +3264,26 @@ raop_v2_resend_range(struct raop_session *rs, uint16_t seqnum, uint16_t len)
   if (seqnum > pktbuf_head->seqnum)
     {
       distance = seqnum - pktbuf_tail->seqnum;
+      sem_wait(&sem);
 
       if (distance > (RETRANSMIT_BUFFER_SIZE / 2))
 	pktbuf = pktbuf_head;
       else
 	pktbuf = pktbuf_tail;
+	      sem_post(&sem);
+
     }
   else
     {
       distance = pktbuf_head->seqnum - seqnum;
 
+      sem_wait(&sem);
       if (distance > (RETRANSMIT_BUFFER_SIZE / 2))
 	pktbuf = pktbuf_tail;
       else
 	pktbuf = pktbuf_head;
+	      sem_post(&sem);
+
     }
 
   if (pktbuf == pktbuf_head)
@@ -3955,6 +3984,7 @@ raop_init(int *v6enabled)
   gpg_error_t gc_err;
   int ret;
 
+pkt_idx=0;
   timing_4svc.fd = -1;
   timing_4svc.port = 0;
 
@@ -4051,6 +4081,12 @@ raop_init(int *v6enabled)
 
   if (*v6enabled)
     *v6enabled = !((timing_6svc.fd < 0) || (control_6svc.fd < 0));
+
+  if(sem_init(&sem,0,1) ==-1)
+  {
+  	  DPRINTF(E_LOG,L_RAOP,"RAOP Semphore init error");
+      goto  out_stop_timing;
+  }
 
   return 0;
 

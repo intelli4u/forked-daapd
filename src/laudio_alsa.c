@@ -28,7 +28,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#include <asoundlib.h>
+#include <alsa/asoundlib.h>
 
 #include "conffile.h"
 #include "logger.h"

@@ -36,7 +36,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <pthread.h>
-
+#include <sched.h>
 #include <uninorm.h>
 
 #if defined(__linux__)
@@ -51,6 +51,8 @@
 # include <sys/eventfd.h>
 #endif
 
+#define REMOTE_NOTIFY_FILE  "/tmp/remote_change"
+#define REMOTE_PAIRING_FILE  "/tmp/shares/forked_daapd.remote"
 #include <event.h>
 
 #include "logger.h"
@@ -89,6 +91,7 @@ static pthread_t tid_scan;
 static struct deferred_pl *playlists;
 static struct stacked_dir *dirstack;
 
+#define ONLY_MUSIC_FILE
 
 static int
 push_dir(struct stacked_dir **s, char *path)
@@ -284,7 +287,10 @@ fixup_tags(struct media_file_info *mfi)
     }
 
   if (!mfi->album_artist_sort && (strcmp(mfi->album_artist, mfi->artist) == 0))
-    mfi->album_artist_sort = strdup(mfi->artist_sort);
+  {
+  	if(mfi->artist_sort)
+        mfi->album_artist_sort = strdup(mfi->artist_sort);
+  }
   else
     normalize_fixup_tag(&mfi->album_artist_sort, mfi->album_artist);
 
@@ -362,11 +368,29 @@ process_media_file(char *file, time_t mtime, off_t size, int compilation)
 	}
       else if ((strcmp(ext, ".png") == 0)
 	       || (strcmp(ext, ".jpg") == 0))
-	{
-	  /* Artwork - don't scan */
-	  goto out;
-	}
-    }
+	    {
+	        /* Artwork - don't scan */
+	        goto out;
+	    }
+#ifdef ONLY_MUSIC_FILE	    
+      else if ((strcmp(ext, ".mp3") != 0)
+	       && (strcmp(ext, ".wav") != 0)
+	       && (strcmp(ext, ".flac") != 0)
+	       && (strcmp(ext, ".asf") != 0)
+	       && (strcmp(ext, ".wma") != 0)
+	       && (strcmp(ext, ".wmv") != 0)
+	       && (strcmp(ext, ".m4a") != 0)
+	       && (strcmp(ext, ".f4v") != 0)
+	       && (strcmp(ext, ".aac") != 0)
+	       && (strcmp(ext, ".amr") != 0)
+	       && (strcmp(ext, ".awb") != 0)
+	       && (strcmp(ext, ".au4") != 0))
+	    {
+	        /* Artwork - don't scan */
+	        goto out;
+	    }
+#endif	    
+  }
 
   /* General case */
   if (ret < 0)
@@ -479,6 +503,15 @@ process_file(char *file, time_t mtime, off_t size, int compilation, int flags)
 {
   char *ext;
 
+  if(access(REMOTE_NOTIFY_FILE,R_OK)!=-1)
+  {
+      if(access(REMOTE_PAIRING_FILE,R_OK)!=-1)
+      {
+  	      remote_pairing_read_pin(REMOTE_PAIRING_FILE);
+      }
+      system("rm /tmp/remote_change -r -f");
+  }
+  
   ext = strrchr(file, '.');
   if (ext)
     {
@@ -752,6 +785,9 @@ bulk_scan(void)
 	  continue;
 	}
 
+if(access(REMOTE_PAIRING_FILE,F_OK)==0)
+		  remote_pairing_read_pin(REMOTE_PAIRING_FILE);
+
       process_directories(deref, F_SCAN_BULK);
 
       free(deref);
@@ -955,6 +991,33 @@ process_inotify_file(struct watch_info *wi, char *path, struct inotify_event *ie
 
   DPRINTF(E_DBG, L_SCAN, "File event: 0x%x, cookie 0x%x, wd %d\n", ie->mask, ie->cookie, wi->wd);
 
+  if ((!strstr(file, ".mp3")) &&
+          (!strstr(file, ".MP3")) &&
+          (!strstr(file, ".Mp3")) &&
+          (!strstr(file, ".mP3")) &&
+          (!strstr(file, ".wav")) &&
+          (!strstr(file, ".flac")) &&
+          (!strstr(file, ".asf")) &&
+          (!strstr(file, ".wma")) &&
+          (!strstr(file, ".wmv")) &&
+          (!strstr(file, ".m4a")) &&
+          (!strstr(file, ".f4v")) &&
+          (!strstr(file, ".aac")) &&
+          (!strstr(file, ".amr")) &&
+          (!strstr(file, ".awb")) &&
+          (!strstr(file, ".au4")) &&
+          (!strstr(file, ".remote")))       
+     return;
+    
+  if(strstr(file,"songs.d-journal"))
+      return;
+
+  if(strstr(file,"sparsebundle"))
+      return;
+
+  if(strstr(file,"sparsebundleands"))
+      return;
+      
   if (ie->mask & IN_DELETE)
     {
       db_file_delete_bypath(path);
@@ -1337,6 +1400,18 @@ exit_cb(int fd, short event, void *arg)
   scan_exit = 1;
 }
 
+/* Added by Foxconn Antony Start 07/08/2013 */
+int filescanner_rescan()
+{
+	int ret;
+  ret = pthread_create(&tid_scan, NULL, filescanner, NULL);
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_SCAN, "Could not spawn filescanner thread: %s\n", strerror(errno));
+    }    
+}
+
+/* Added by Foxconn Antony End */
 
 /* Thread: main */
 int
@@ -1344,6 +1419,11 @@ filescanner_init(void)
 {
   int ret;
 
+  struct sched_param t_scan_param;
+  int rs;
+  int policy;
+  int sched = SCHED_RR;
+  
   scan_exit = 0;
 
   evbase_scan = event_base_new();
@@ -1417,6 +1497,10 @@ filescanner_init(void)
 
       goto thread_fail;
     }
+
+   t_scan_param.sched_priority = 80;
+   
+   pthread_setschedparam(tid_scan, sched, &t_scan_param);
 
   return 0;
 

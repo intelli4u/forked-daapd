@@ -103,6 +103,19 @@ dacp_propget_nowplaying(struct evbuffer *evbuf, struct player_status *status, st
 static void
 dacp_propget_playingtime(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
 
+static void 
+dacp_propget_fullscreenenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+static void 
+dacp_propget_fullscreen(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+static void 
+dacp_propget_visualizerenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+static void 
+dacp_propget_visualizer(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+static void 
+dacp_propget_itms_songid(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+static void 
+dacp_propget_haschapterdata(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+
 /* Forward - properties setters */
 static void
 dacp_propset_volume(const char *value, struct evkeyvalq *query);
@@ -135,6 +148,42 @@ static struct dacp_update_request *update_requests;
 /* Seek timer */
 static struct event seek_timer;
 static int seek_target;
+
+static void 
+dacp_propget_fullscreenenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
+{ 
+  // TODO 
+} 
+
+static void 
+dacp_propget_fullscreen(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
+{ 
+  // TODO 
+} 
+
+static void 
+dacp_propget_visualizerenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
+{ 
+  // TODO 
+} 
+
+static void 
+dacp_propget_visualizer(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
+{ 
+  // TODO 
+} 
+ 
+static void 
+dacp_propget_itms_songid(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
+{ 
+  // TODO 
+} 
+ 
+static void 
+dacp_propget_haschapterdata(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
+{ 
+  // TODO 
+} 
 
 
 /* DACP helpers */
@@ -973,6 +1022,14 @@ dacp_reply_previtem(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 {
   struct daap_session *s;
   int ret;
+
+  /*
+   * Support (Android) remotes that always send playpause to pause or start a
+   * song.
+   */
+  if(player_is_playing())
+    return dacp_reply_pause(req, evbuf, uri, query);
+
 
   s = daap_session_find(req, query, evbuf);
   if (!s)

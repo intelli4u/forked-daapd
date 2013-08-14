@@ -47,7 +47,7 @@ static cfg_opt_t sec_general[] =
     CFG_STR("uid", "nobody", CFGF_NONE),
     CFG_STR("admin_password", NULL, CFGF_NONE),
     CFG_STR("logfile", STATEDIR "/log/" PACKAGE ".log", CFGF_NONE),
-    CFG_STR("db_path", STATEDIR "/cache/" PACKAGE "/songs3.db", CFGF_NONE),
+    CFG_STR("db_path",  "/var/songs3.db", CFGF_NONE),
     CFG_INT_CB("loglevel", E_LOG, CFGF_NONE, &cb_loglevel),
     CFG_BOOL("ipv6", cfg_true, CFGF_NONE),
     CFG_END()
@@ -269,8 +269,8 @@ conffile_load(char *file)
 
   /* Resolve runas username */
   runas = cfg_getstr(cfg_getsec(cfg, "general"), "uid");
-  pw = getpwnam(runas);
-  if (!pw)
+  pw = getpwnam("admin");
+  if (!pw) 
     {
       DPRINTF(E_FATAL, L_CONF, "Could not lookup user %s: %s\n", runas, strerror(errno));
 

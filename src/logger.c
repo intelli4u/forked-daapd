@@ -86,6 +86,7 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
   time_t t;
   int ret;
 
+
   if (!((1 << domain) & logdomains) || (severity > threshold))
     return;
 
@@ -113,7 +114,7 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
       fflush(logfile);
     }
 
-  if (console)
+  if (1)
     {
       fprintf(stderr, "%8s: ", labels[domain]);
 

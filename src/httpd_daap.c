@@ -58,9 +58,10 @@ extern struct event_base *evbase_httpd;
 
 
 /* Session timeout in seconds */
-#define DAAP_SESSION_TIMEOUT 1800
+#define DAAP_SESSION_TIMEOUT 0
+#define DAAP_SESSION_TIMEOUT_CAPABILITY 1800 
 /* Update requests refresh interval in seconds */
-#define DAAP_UPDATE_REFRESH  300
+#define DAAP_UPDATE_REFRESH  0
 
 
 struct uri_map {
@@ -130,7 +131,8 @@ daap_session_free(void *item)
 
   s = (struct daap_session *)item;
 
-  evtimer_del(&s->timeout);
+//  evtimer_del(&s->timeout);
+  if (event_initialized(&s->timeout)) evtimer_del(&s->timeout);
   free(s);
 }
 
@@ -173,9 +175,12 @@ daap_session_register(void)
 
   next_session_id++;
 
-  evtimer_set(&s->timeout, daap_session_timeout_cb, s);
-  event_base_set(evbase_httpd, &s->timeout);
-
+//  evtimer_set(&s->timeout, daap_session_timeout_cb, s);
+//  event_base_set(evbase_httpd, &s->timeout);
+  if (DAAP_SESSION_TIMEOUT > 0) {
+    evtimer_set(&s->timeout, daap_session_timeout_cb, s);
+    event_base_set(evbase_httpd, &s->timeout);
+  }
   node = avl_insert(daap_sessions, s);
   if (!node)
     {
@@ -185,13 +190,21 @@ daap_session_register(void)
       return NULL;
     }
 
-  evutil_timerclear(&tv);
-  tv.tv_sec = DAAP_SESSION_TIMEOUT;
+//  evutil_timerclear(&tv);
+//  tv.tv_sec = DAAP_SESSION_TIMEOUT;
 
-  ret = evtimer_add(&s->timeout, &tv);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+//  ret = evtimer_add(&s->timeout, &tv);
+//  if (ret < 0)
+//    DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
 
+  if (DAAP_SESSION_TIMEOUT > 0) {
+    evutil_timerclear(&tv);
+    tv.tv_sec = DAAP_SESSION_TIMEOUT;
+    
+    ret = evtimer_add(&s->timeout, &tv);
+    if (ret < 0)
+      DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+  }
   return s;
 }
 
@@ -225,15 +238,23 @@ daap_session_find(struct evhttp_request *req, struct evkeyvalq *query, struct ev
 
   s = (struct daap_session *)node->item;
 
-  event_del(&s->timeout);
+//  event_del(&s->timeout);
 
+  if (DAAP_SESSION_TIMEOUT > 0) {
+    event_del(&s->timeout);
+  }
   evutil_timerclear(&tv);
   tv.tv_sec = DAAP_SESSION_TIMEOUT;
 
-  ret = evtimer_add(&s->timeout, &tv);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+//  ret = evtimer_add(&s->timeout, &tv);
+//  if (ret < 0)
+//    DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
 
+  if (DAAP_SESSION_TIMEOUT > 0) {
+    ret = evtimer_add(&s->timeout, &tv);
+    if (ret < 0)
+      DPRINTF(E_LOG, L_DAAP, "Could not add session timeout event for session %d\n", s->id);
+  }
   return s;
 
  invalid:
@@ -681,7 +702,7 @@ daap_reply_server_info(struct evhttp_request *req, struct evbuffer *evbuf, char 
   dmap_add_int(evbuf, "apro", apro); /* 12 */
   dmap_add_string(evbuf, "minm", name); /* 8 + strlen(name) */
 
-  dmap_add_int(evbuf, "mstm", DAAP_SESSION_TIMEOUT); /* 12 */
+  dmap_add_int(evbuf, "mstm", DAAP_SESSION_TIMEOUT_CAPABILITY); /* 12 */
   dmap_add_char(evbuf, "msal", 1);   /* 9 */
 
   dmap_add_char(evbuf, "mslr", 1);   /* 9 */
@@ -782,6 +803,8 @@ daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
       pi.guid = strdup(guid + 2); /* Skip leading 0X */
 
       ret = db_pairing_fetch_byguid(&pi);
+
+#if 0
       if (ret < 0)
 	{
 	  DPRINTF(E_LOG, L_DAAP, "Login attempt with invalid pairing-guid\n");
@@ -791,6 +814,7 @@ daap_reply_login(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
 	  return;
 	}
 
+#endif
       DPRINTF(E_INFO, L_DAAP, "Remote '%s' logging in with GUID %s\n", pi.name, pi.guid);
       free_pi(&pi, 1);
     }
@@ -842,8 +866,9 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     {
       DPRINTF(E_LOG, L_DAAP, "Missing revision-number in update request\n");
 
-      dmap_send_error(req, "mupd", "Invalid request");
-      return;
+//      dmap_send_error(req, "mupd", "Invalid request");
+//      return;
+        param = "1";
     }
 
   ret = safe_atoi32(param, &reqd_rev);
@@ -887,6 +912,7 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
     }
   memset(ur, 0, sizeof(struct daap_update_request));
 
+  if (DAAP_UPDATE_REFRESH > 0) {
   evtimer_set(&ur->timeout, update_refresh_cb, ur);
   event_base_set(evbase_httpd, &ur->timeout);
 
@@ -903,7 +929,7 @@ daap_reply_update(struct evhttp_request *req, struct evbuffer *evbuf, char **uri
       update_free(ur);
       return;
     }
-
+  }
   /* NOTE: we may need to keep reqd_rev in there too */
   ur->req = req;
 

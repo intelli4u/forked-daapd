@@ -23,6 +23,7 @@
 #include <stdlib.h>
 
 #include <libavformat/avformat.h>
+//#include <libavformat/url.h>
 
 #include <event.h>
 
@@ -42,14 +43,14 @@ url_evbuffer_open(URLContext *h, const char *filename, int flags)
   const char *p;
   char *end;
   unsigned long evbuffer_addr;
-
+#if 0
   if (flags != URL_WRONLY)
     {
       DPRINTF(E_LOG, L_FFMPEG, "Flags other than URL_WRONLY not supported while opening '%s'\n", filename);
 
       return AVERROR(EIO);
     }
-
+#endif
   p = strchr(filename, ':');
   if (!p)
     {
@@ -131,7 +132,8 @@ register_ffmpeg_evbuffer_url_protocol(void)
 {
   int ret;
 
-  ret = av_register_protocol(&evbuffer_protocol);
+//  ret = av_register_protocol(&evbuffer_protocol);
+//  ret=ffurl_register_protocol(&evbuffer_protocol, sizeof(struct URLProtocol));
 
   return ret;
 }
