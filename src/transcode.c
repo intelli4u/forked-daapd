@@ -367,7 +367,7 @@ transcode_setup(struct media_file_info *mfi, off_t *est_size, int wavhdr)
       return NULL;
     }
 
-  ret = av_find_stream_info(ctx->fmtctx);
+  ret = avformat_find_stream_info(ctx->fmtctx,NULL);
   if (ret < 0)
     {
       DPRINTF(E_WARN, L_XCODE, "Could not find stream info: %s\n", strerror(AVUNERROR(ret)));
@@ -410,7 +410,7 @@ transcode_setup(struct media_file_info *mfi, off_t *est_size, int wavhdr)
   if (ctx->adecoder->capabilities & CODEC_CAP_TRUNCATED)
     ctx->acodec->flags |= CODEC_FLAG_TRUNCATED;
 
-  ret = avcodec_open(ctx->acodec, ctx->adecoder);
+  ret = avcodec_open2(ctx->acodec, ctx->adecoder,NULL);
   if (ret != 0)
     {
       DPRINTF(E_WARN, L_XCODE, "Could not open codec: %s\n", strerror(AVUNERROR(ret)));
@@ -426,7 +426,8 @@ transcode_setup(struct media_file_info *mfi, off_t *est_size, int wavhdr)
       goto setup_fail_codec;
     }
 
-  if ((ctx->acodec->sample_fmt != SAMPLE_FMT_S16)
+  if ((ctx->acodec->sample_fmt != AV_SAMPLE_FMT_S16)
+//  if ((ctx->acodec->sample_fmt != SAMPLE_FMT_S16)
       || (ctx->acodec->channels != 2)
       || (ctx->acodec->sample_rate != 44100))
     {
@@ -434,7 +435,8 @@ transcode_setup(struct media_file_info *mfi, off_t *est_size, int wavhdr)
 
       ctx->resample_ctx = av_audio_resample_init(2,              ctx->acodec->channels,
 						 44100,          ctx->acodec->sample_rate,
-						 SAMPLE_FMT_S16, ctx->acodec->sample_fmt,
+						 AV_SAMPLE_FMT_S16, ctx->acodec->sample_fmt,
+//						 SAMPLE_FMT_S16, ctx->acodec->sample_fmt,
 						 16, 10, 0, 0.8);
 
       if (!ctx->resample_ctx)
@@ -587,7 +589,12 @@ transcode_needed(struct evkeyvalq *headers, char *file_codectype)
 
 	      client_codecs = roku_codecs;
 	    }
-	  else if (strncmp(user_agent, "Hifidelio", strlen("Hifidelio")) == 0)
+      else if (strncmp(user_agent, "AppleCoreMedia", strlen("AppleCoreMedia")) == 0)
+        {
+          DPRINTF(E_DBG, L_XCODE, "Client is a AppleCoreMedia, using iTunes codecs\n"); 
+          client_codecs = itunes_codecs;       
+      }      	  
+      else if (strncmp(user_agent, "Hifidelio", strlen("Hifidelio")) == 0)
 	    {
 	      DPRINTF(E_DBG, L_XCODE, "Client is a Hifidelio device, allegedly cannot transcode\n");
 

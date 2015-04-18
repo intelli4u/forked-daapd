@@ -184,6 +184,7 @@ static uint64_t last_rtptime;
 /* AirTunes devices */
 static int dev_autoselect;
 static struct raop_device *dev_list;
+static uint8_t laudio_enabled;
 
 /* Device status */
 static enum laudio_state laudio_status;
@@ -288,7 +289,8 @@ volume_master_update(int newvol)
 
   master_volume = newvol;
 
-  if (laudio_selected)
+//  if (laudio_selected)
+  if (laudio_enabled & laudio_selected)
     laudio_relvol = vol_to_rel(laudio_volume);
 
   for (rd = dev_list; rd; rd = rd->next)
@@ -306,7 +308,8 @@ volume_master_find(void)
 
   newmaster = -1;
 
-  if (laudio_selected)
+//  if (laudio_selected)
+  if (laudio_enabled & laudio_selected)
     newmaster = laudio_volume;
 
   for (rd = dev_list; rd; rd = rd->next)
@@ -370,6 +373,11 @@ speaker_deselect_raop(struct raop_device *rd)
     volume_master_find();
 }
 
+int
+player_is_playing(void)
+{
+  return player_state == PLAY_PLAYING ? 1 : 0;
+}
 
 static int
 player_get_current_pos_clock(uint64_t *pos, struct timespec *ts, int commit)
@@ -1251,7 +1259,8 @@ playback_write(void)
       return;
     }
 
-  if (laudio_status & LAUDIO_F_STARTED)
+  if (laudio_enabled & laudio_status & LAUDIO_F_STARTED)
+//  if (laudio_status & LAUDIO_F_STARTED)
     laudio_write(rawbuf, last_rtptime);
 
   if (raop_sessions > 0)
@@ -1438,7 +1447,7 @@ device_add(struct player_command *cmd)
 	  rd->volume = (master_volume >= 0) ? master_volume : 75;
 	}
 
-      if (dev_autoselect && selected)
+//      if (dev_autoselect && selected)
 	speaker_select_raop(rd);
 
       rd->next = dev_list;
@@ -1826,7 +1835,8 @@ device_restart_cb(struct raop_device *dev, struct raop_session *rs, enum raop_se
 static void
 playback_abort(void)
 {
-  if (laudio_status != LAUDIO_CLOSED)
+  if (laudio_enabled && laudio_status != LAUDIO_CLOSED)
+//  if (laudio_status != LAUDIO_CLOSED)
     laudio_close();
 
   if (raop_sessions > 0)
@@ -1870,7 +1880,8 @@ get_status(struct player_command *cmd)
   status->repeat = repeat;
 
   /* No devices selected, autoselect local audio */
-  if (master_volume < 0)
+  if (laudio_enabled && master_volume < 0)
+//  if (master_volume < 0)
     speaker_select_laudio();
 
   status->volume = master_volume;
@@ -1959,7 +1970,8 @@ now_playing(struct player_command *cmd)
 static int
 playback_stop(struct player_command *cmd)
 {
-  if (laudio_status != LAUDIO_CLOSED)
+//  if (laudio_status != LAUDIO_CLOSED)
+  if (laudio_enabled && laudio_status != LAUDIO_CLOSED)
     laudio_close();
 
   /* We may be restarting very soon, so we don't bring the devices to a
@@ -2227,7 +2239,8 @@ playback_start(struct player_command *cmd)
 
   for (rd = dev_list; rd; rd = rd->next)
     {
-      if (rd->selected && !rd->session)
+//      if (rd->selected && !rd->session)
+      if ( !rd->session)
 	{
 	  ret = raop_device_start(rd, device_restart_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
 	  if (ret < 0)
@@ -2468,18 +2481,23 @@ speaker_enumerate(struct player_command *cmd)
   laudio_name = cfg_getstr(cfg_getsec(cfg, "audio"), "nickname");
 
   /* Auto-select local audio if there are no AirTunes devices */
-  if (!dev_list && !laudio_selected)
+//  if (!dev_list && !laudio_selected)
+  if (laudio_enabled && !dev_list && !laudio_selected)
     speaker_select_laudio();
 
   flags.selected = laudio_selected;
   flags.has_password = 0;
   flags.has_video = 0;
 
-  spk_enum->cb(0, laudio_name, laudio_relvol, flags, spk_enum->arg);
+  if (laudio_enabled)
+    spk_enum->cb(0, laudio_name, laudio_relvol, flags, spk_enum->arg);
+//  spk_enum->cb(0, laudio_name, laudio_relvol, flags, spk_enum->arg);
 
 #ifdef DEBUG_RELVOL
   DPRINTF(E_DBG, L_PLAYER, "*** master: %d\n", master_volume);
-  DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
+  if (laudio_enabled)
+    DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
+//  DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
 #endif
 
   for (rd = dev_list; rd; rd = rd->next)
@@ -2508,7 +2526,8 @@ speaker_activate(struct raop_device *rd)
   uint64_t pos;
   int ret;
 
-  if (!rd)
+//  if (!rd)
+  if (!rd && laudio_enabled)
     {
       /* Local */
       DPRINTF(E_DBG, L_PLAYER, "Activating local audio\n");
@@ -2586,7 +2605,8 @@ speaker_activate(struct raop_device *rd)
 static int
 speaker_deactivate(struct raop_device *rd)
 {
-  if (!rd)
+//  if (!rd)
+  if (!rd && laudio_enabled)
     {
       /* Local */
       DPRINTF(E_DBG, L_PLAYER, "Deactivating local audio\n");
@@ -2704,36 +2724,38 @@ speaker_set(struct player_command *cmd)
     }
 
   /* Local audio */
-  for (i = 1; i <= nspk; i++)
-    {
-      if (ids[i] == 0)
-	break;
-    }
-
-  if (i <= nspk)
-    {
-      DPRINTF(E_DBG, L_PLAYER, "Local audio selected\n");
-
-      if (!laudio_selected)
-	speaker_select_laudio();
-
-      if (!(laudio_status & LAUDIO_F_STARTED))
-	{
-	  ret = speaker_activate(NULL);
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not activate local audio output\n");
-
-	      speaker_deselect_laudio();
-
-	      if (cmd->ret != -2)
-		cmd->ret = -1;
-	    }
-	}
-    }
-  else
-    {
-      DPRINTF(E_DBG, L_PLAYER, "Local audio NOT selected\n");
+  if(laudio_enabled)
+     {
+      for (i = 1; i <= nspk; i++)
+        {
+          if (ids[i] == 0)
+          break;
+        }
+ 
+      if (i <= nspk)
+        {
+          DPRINTF(E_DBG, L_PLAYER, "Local audio selected\n");
+ 
+          if (!laudio_selected)
+            speaker_select_laudio();
+ 
+          if (!(laudio_status & LAUDIO_F_STARTED))
+            {
+              ret = speaker_activate(NULL);
+              if (ret < 0)
+                {
+                  DPRINTF(E_LOG, L_PLAYER, "Could not activate local audio output\n");
+ 
+                  speaker_deselect_laudio();
+ 
+                  if (cmd->ret != -2)
+                    cmd->ret = -1;
+                }
+            }
+        }
+      else
+        {
+          DPRINTF(E_DBG, L_PLAYER, "Local audio NOT selected\n");
 
       if (laudio_selected)
 	speaker_deselect_laudio();
@@ -2747,6 +2769,7 @@ speaker_set(struct player_command *cmd)
 
 	      if (cmd->ret != -2)
 		cmd->ret = -1;
+                }
 	    }
 	}
     }
@@ -2784,9 +2807,10 @@ volume_set(struct player_command *cmd)
 
   for (rd = dev_list; rd; rd = rd->next)
     {
+/*    	
       if (!rd->selected)
 	continue;
-
+*/
       rd->volume = rel_to_vol(rd->relvol);
 
 #ifdef DEBUG_RELVOL
@@ -3670,20 +3694,20 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
   password = NULL;
   p = keyval_get(txt, "pw");
   if (!p)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: no pw field in TXT record!\n", name);
-
-      goto free_rd;
+    { 
+      DPRINTF(E_INFO, L_PLAYER, "AirTunes %s: no pw field in TXT record, assuming no password protection\n", name);
+      has_password = 0;
     }
-
-  if (*p == '\0')
+  else if (*p == '\0')
     {
       DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: pw has no value\n", name);
 
       goto free_rd;
     }
-
-  has_password = (strcmp(p, "false") != 0);
+  else
+    {
+      has_password = (strcmp(p, "false") != 0);
+    }
 
   if (has_password)
     {
@@ -3719,6 +3743,8 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
 
   if (strncmp(p, "AppleTV", strlen("AppleTV")) == 0)
     devtype = RAOP_DEV_APPLETV;
+  else if (strncmp(p, "AirPort4", strlen("AirPort4")) != 0)
+    devtype = OTHER;
 
  no_am:
   DPRINTF(E_DBG, L_PLAYER, "AirTunes device %s: password: %s, type %s\n", name, (password) ? "yes" : "no", raop_devtype[devtype]);
@@ -3814,7 +3840,10 @@ player_init(void)
   dev_list = NULL;
 
   master_volume = -1;
+  laudio_enabled = 0;
 
+//  laudio_enabled = cfg_getbool(cfg_getsec(cfg, "general"), "laudio_enable");
+//  laudio_enabled = 1;
   laudio_selected = 0;
   laudio_status = LAUDIO_CLOSED;
   raop_sessions = 0;

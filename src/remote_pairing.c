@@ -31,6 +31,8 @@
 # include <config.h>
 #endif
 
+#define NO_REMOTE_DEVICE_NAME
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -362,6 +364,17 @@ add_remote_pin_data(char *devname, char *pin)
 {
   struct remote_info *ri;
 
+#ifdef NO_REMOTE_DEVICE_NAME
+  for (ri = remote_list; ri; ri = ri->next)
+  {
+    if (ri->pin)
+      free(ri->pin);
+    
+    ri->pin = pin;
+    	
+  }
+
+#else
   for (ri = remote_list; ri; ri = ri->next)
     {
       if (strcmp(ri->pi.name, devname) == 0)
@@ -381,7 +394,7 @@ add_remote_pin_data(char *devname, char *pin)
     free(ri->pin);
 
   ri->pin = pin;
-
+#endif
   return 0;
 }
 
@@ -397,10 +410,21 @@ kickoff_pairing(void)
 #else
   int dummy = 42;
   int ret;
+  int retry=0;
 
+rewrite:
   ret = write(pairing_pipe[1], &dummy, sizeof(dummy));
   if (ret != sizeof(dummy))
+  {
+  	retry++;
     DPRINTF(E_LOG, L_REMOTE, "Could not write to pairing fd: %s\n", strerror(errno));
+
+    if(retry<10)
+    {
+        sleep(1);
+        goto rewrite;
+    }
+  }
 #endif
 }
 

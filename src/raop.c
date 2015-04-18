@@ -46,6 +46,9 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <time.h>
+#include <semaphore.h>
+
+sem_t sem;
 
 #if defined(__linux__) || defined(__GLIBC__)
 # include <endian.h>
@@ -95,6 +98,9 @@ struct raop_v2_packet
   struct raop_v2_packet *prev;
   struct raop_v2_packet *next;
 };
+
+struct raop_v2_packet pkt_array[RETRANSMIT_BUFFER_SIZE+1];
+int pkt_idx;
 
 struct raop_session
 {
@@ -1190,9 +1196,9 @@ raop_check_cseq(struct raop_session *rs, struct evrtsp_request *req)
   reply_cseq = raop_grab_cseq(req->input_headers);
   if (reply_cseq < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "No CSeq in reply\n");
+      DPRINTF(E_LOG, L_RAOP, "No CSeq in reply, skipping check\n");
 
-      return -1;
+      return 0;
     }
 
   request_cseq = raop_grab_cseq(req->output_headers);
@@ -1225,6 +1231,15 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
     "a=fmtp:96 %d 0 16 40 10 14 2 255 0 0 44100\r\n"			\
     "a=rsaaeskey:%s\r\n"						\
     "a=aesiv:%s\r\n"
+#define SDP_PLD_FMT_NO_ENC						\
+  "v=0\r\n"								\
+    "o=iTunes %u 0 IN IP4 %s\r\n"					\
+    "s=iTunes\r\n"							\
+    "c=IN IP4 %s\r\n"							\
+    "t=0 0\r\n"								\
+    "m=audio 0 RTP/AVP 96\r\n"						\
+    "a=rtpmap:96 AppleLossless\r\n"					\
+    "a=fmtp:96 %d 0 16 40 10 14 2 255 0 0 44100\r\n"
 
   char *p;
   int ret;
@@ -1233,10 +1248,14 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
   if (p)
     *p = '\0';
 
-  /* Add SDP payload */
-  ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
-			    session_id, address, rs->address, AIRTUNES_V2_PACKET_SAMPLES,
-			    raop_aes_key_b64, raop_aes_iv_b64);
+  /* Add SDP payload - but don't add RSA/AES key/iv if no encryption - important for ATV3 update 6.0 */
+  if (rs->encrypt)
+    ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
+			      session_id, address, rs->address, AIRTUNES_V2_PACKET_SAMPLES,
+			      raop_aes_key_b64, raop_aes_iv_b64);
+  else
+    ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT_NO_ENC,
+			      session_id, address, rs->address, AIRTUNES_V2_PACKET_SAMPLES);
 
   if (p)
     *p = '%';
@@ -1251,6 +1270,7 @@ raop_make_sdp(struct raop_session *rs, struct evrtsp_request *req, char *address
   return 0;
 
 #undef SDP_PLD_FMT
+#undef SDP_PLD_FMT_NO_ENC
 }
 
 
@@ -1586,24 +1606,27 @@ raop_send_req_announce(struct raop_session *rs, evrtsp_req_cb cb)
 
   evrtsp_add_header(req->output_headers, "Content-Type", "application/sdp");
 
-  /* Challenge */
-  gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
-  challenge_b64 = b64_encode(challenge, sizeof(challenge));
-  if (!challenge_b64)
+  /* Challenge - but only if session is encrypted (important for ATV3 after update 6.0) */
+  if (rs->encrypt)
     {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't encode challenge\n");
+      gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
+      challenge_b64 = b64_encode(challenge, sizeof(challenge));
+      if (!challenge_b64)
+	{
+	  DPRINTF(E_LOG, L_RAOP, "Couldn't encode challenge\n");
 
-      goto cleanup_req;
+	  goto cleanup_req;
+	}
+
+      /* Remove base64 padding */
+      ptr = strchr(challenge_b64, '=');
+      if (ptr)
+	*ptr = '\0';
+
+      evrtsp_add_header(req->output_headers, "Apple-Challenge", challenge_b64);
+
+      free(challenge_b64);
     }
-
-  /* Remove base64 padding */
-  ptr = strchr(challenge_b64, '=');
-  if (ptr)
-    *ptr = '\0';
-
-  evrtsp_add_header(req->output_headers, "Apple-Challenge", challenge_b64);
-
-  free(challenge_b64);
 
   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_ANNOUNCE, rs->session_url);
   if (ret < 0)
@@ -1708,12 +1731,17 @@ raop_session_cleanup(struct raop_session *rs)
   /* No more active sessions, free retransmit buffer */
   if (!sessions)
     {
+      sem_wait(&sem);
       for (pkt = pktbuf_head; pkt; pkt = pkt->next)
-	free(pkt);
+      {
+//	free(pkt);
+       pktbuf_size--;
 
+    }
       pktbuf_head = NULL;
       pktbuf_tail = NULL;
       pktbuf_size = 0;
+      sem_post(&sem);
     }
 }
 
@@ -3049,15 +3077,19 @@ raop_v2_new_packet(void)
 
   if (pktbuf_size >= RETRANSMIT_BUFFER_SIZE)
     {
+      sem_wait(&sem);
+
       pktbuf_size--;
 
       pkt = pktbuf_tail;
 
       pktbuf_tail = pktbuf_tail->prev;
       pktbuf_tail->next = NULL;
+      sem_post(&sem);
     }
   else
     {
+/*
       pkt = (struct raop_v2_packet *)malloc(sizeof(struct raop_v2_packet));
       if (!pkt)
 	{
@@ -3065,6 +3097,12 @@ raop_v2_new_packet(void)
 
 	  return NULL;
 	}
+*/
+      pkt=&pkt_array[pkt_idx];	
+      pkt_idx++;
+      if(pkt_idx>RETRANSMIT_BUFFER_SIZE)
+      	pkt_idx=0;
+      
     }
 
   return pkt;
@@ -3121,7 +3159,7 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not reset AES cipher: %s\n", ebuf);
 
-      free(pkt);
+//      free(pkt);
       return NULL;
     }
 
@@ -3132,7 +3170,7 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not set AES IV: %s\n", ebuf);
 
-      free(pkt);
+//      free(pkt);
       return NULL;
     }
 
@@ -3145,9 +3183,10 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
       gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
       DPRINTF(E_LOG, L_RAOP, "Could not encrypt payload: %s\n", ebuf);
 
-      free(pkt);
+//      free(pkt);
       return NULL;
     }
+  sem_wait(&sem);
 
   pkt->prev = NULL;
   pkt->next = pktbuf_head;
@@ -3161,6 +3200,7 @@ raop_v2_make_packet(uint8_t *rawbuf, uint64_t rtptime)
   pktbuf_head = pkt;
 
   pktbuf_size++;
+      sem_post(&sem);
 
   return pkt;
 }
@@ -3241,20 +3281,26 @@ raop_v2_resend_range(struct raop_session *rs, uint16_t seqnum, uint16_t len)
   if (seqnum > pktbuf_head->seqnum)
     {
       distance = seqnum - pktbuf_tail->seqnum;
+      sem_wait(&sem);
 
       if (distance > (RETRANSMIT_BUFFER_SIZE / 2))
 	pktbuf = pktbuf_head;
       else
 	pktbuf = pktbuf_tail;
+	      sem_post(&sem);
+
     }
   else
     {
       distance = pktbuf_head->seqnum - seqnum;
 
+      sem_wait(&sem);
       if (distance > (RETRANSMIT_BUFFER_SIZE / 2))
 	pktbuf = pktbuf_tail;
       else
 	pktbuf = pktbuf_head;
+	      sem_post(&sem);
+
     }
 
   if (pktbuf == pktbuf_head)
@@ -3955,6 +4001,7 @@ raop_init(int *v6enabled)
   gpg_error_t gc_err;
   int ret;
 
+pkt_idx=0;
   timing_4svc.fd = -1;
   timing_4svc.port = 0;
 
@@ -4051,6 +4098,12 @@ raop_init(int *v6enabled)
 
   if (*v6enabled)
     *v6enabled = !((timing_6svc.fd < 0) || (control_6svc.fd < 0));
+
+  if(sem_init(&sem,0,1) ==-1)
+  {
+  	  DPRINTF(E_LOG,L_RAOP,"RAOP Semphore init error");
+      goto  out_stop_timing;
+  }
 
   return 0;
 

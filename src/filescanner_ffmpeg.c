@@ -341,7 +341,7 @@ scan_metadata_ffmpeg(char *file, struct media_file_info *mfi)
       return -1;
     }
 
-  ret = av_find_stream_info(ctx);
+  ret = avformat_find_stream_info(ctx,NULL);
   if (ret < 0)
     {
       DPRINTF(E_WARN, L_SCAN, "Cannot get stream info: %s\n", strerror(AVUNERROR(ret)));
@@ -377,6 +377,7 @@ scan_metadata_ffmpeg(char *file, struct media_file_info *mfi)
 #else
 	  case CODEC_TYPE_VIDEO:
 #endif
+//	    if (!video_stream && !(ctx->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC))
 	    if (!video_stream)
 	      {
 		DPRINTF(E_DBG, L_SCAN, "File has video (stream %d)\n", i);

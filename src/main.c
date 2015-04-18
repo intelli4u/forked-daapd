@@ -48,8 +48,8 @@
 
 #include <getopt.h>
 #include <event.h>
-#include <libavutil/log.h>
-#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+//#include <libavformat/avformat.h>
 
 #include <gcrypt.h>
 GCRY_THREAD_OPTION_PTHREAD_IMPL;
@@ -447,6 +447,7 @@ main(int argc, char **argv)
   const char *gcry_version;
   sigset_t sigs;
   int sigfd;
+  int fp;
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
   struct kevent ke_sigs[4];
 #endif
@@ -477,7 +478,7 @@ main(int argc, char **argv)
   ffid = NULL;
   mdns_no_rsp = 0;
   mdns_no_daap = 0;
-
+ 
   while ((option = getopt_long(argc, argv, "D:d:c:P:fb:v", option_map, NULL)) != -1)
     {
       switch (option)
@@ -570,7 +571,7 @@ main(int argc, char **argv)
   DPRINTF(E_LOG, L_MAIN, "Forked Media Server Version %s taking off\n", VERSION);
 
   /* Initialize ffmpeg */
-  avcodec_init();
+//  avcodec_init();
 
   ret = av_lockmgr_register(ffmpeg_lockmgr);
   if (ret < 0)
@@ -580,7 +581,6 @@ main(int argc, char **argv)
       ret = EXIT_FAILURE;
       goto ffmpeg_init_fail;
     }
-
   av_register_all();
   av_log_set_callback(logger_ffmpeg);
 #if LIBAVFORMAT_VERSION_MAJOR < 53
@@ -625,6 +625,7 @@ main(int argc, char **argv)
     }
 
   /* Daemonize and drop privileges */
+#if 0
   ret = daemonize(background, pidfile);
   if (ret < 0)
     {
@@ -633,7 +634,18 @@ main(int argc, char **argv)
       ret = EXIT_FAILURE;
       goto daemon_fail;
     }
+#else
+      fp = fopen(pidfile, "w");
+      if (!fp)
+     	{
+	        DPRINTF(E_LOG, L_MAIN, "Error opening pidfile (%s): %s\n", pidfile, strerror(errno));
+	        return -1;
+	    }
 
+      fprintf(fp, "%d\n", getpid());
+      fclose(fp);
+
+#endif
   /* Initialize libevent (after forking) */
   evbase_main = event_init();
 
