@@ -201,7 +201,6 @@ unlink_remote(struct remote_info *ri)
 static void
 free_remote(struct remote_info *ri)
 {
-	return 0;
   if (ri->paircode)
     free(ri->paircode);
 
@@ -516,8 +515,7 @@ pairing_request_cb(struct evhttp_request *req, void *arg)
     }
 
  cleanup:
-return;
-//  evhttp_connection_free(ri->evcon);
+  evhttp_connection_free(ri->evcon);
   free_remote(ri);
 }
 
@@ -674,27 +672,26 @@ pairing_cb(int fd, short event, void *arg)
     ; /* EMPTY */
 #endif
 
-//  for (;;)
+  for (;;)
     {
-//      pthread_mutex_lock(&remote_lck);
+      pthread_mutex_lock(&remote_lck);
 
       for (ri = remote_list; ri; ri = ri->next)
 	{
 	  /* We've got both the mDNS data and the pin */
 	  if (ri->paircode && ri->pin)
 	    {
-      do_pairing(ri);
-//	      unlink_remote(ri);
-//	      break;
+	      unlink_remote(ri);
+	      break;
 	    }
 	}
 
-//      pthread_mutex_unlock(&remote_lck);
+      pthread_mutex_unlock(&remote_lck);
 
-//      if (!ri)
-//	break;
+      if (!ri)
+	break;
 
-//      do_pairing(ri);
+      do_pairing(ri);
     }
 
   event_add(&pairingev, NULL);
