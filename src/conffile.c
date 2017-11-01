@@ -55,6 +55,7 @@ static cfg_opt_t sec_general[] =
     CFG_BOOL("ipv6", cfg_true, CFGF_NONE),
     CFG_STR("cache_path", STATEDIR "/cache/" PACKAGE "/cache.db", CFGF_NONE),
     CFG_INT("cache_daap_threshold", 1000, CFGF_NONE),
+    CFG_STR("allow_origin", NULL, CFGF_NONE),
     CFG_END()
   };
 
@@ -84,6 +85,7 @@ static cfg_opt_t sec_library[] =
     CFG_STR_LIST("filepath_ignore", NULL, CFGF_NONE),
     CFG_BOOL("filescan_disable", cfg_false, CFGF_NONE),
     CFG_BOOL("itunes_overrides", cfg_false, CFGF_NONE),
+    CFG_BOOL("itunes_smartpl", cfg_false, CFGF_NONE),
     CFG_STR_LIST("no_decode", NULL, CFGF_NONE),
     CFG_STR_LIST("force_decode", NULL, CFGF_NONE),
     CFG_END()

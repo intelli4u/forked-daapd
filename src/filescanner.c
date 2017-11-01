@@ -52,6 +52,14 @@
 # include <regex.h>
 #endif
 
+/* Foxconn added start pling 07/04/2016 */
+/* Port from forked-daapd */
+#define ONLY_MUSIC_FILE
+#define MAX_MEDIA_FILE 10000
+
+#define REMOTE_NOTIFY_FILE  "/tmp/remote_change"
+#define REMOTE_PAIRING_FILE  "/tmp/shares/forked_daapd.remote"
+/* Foxconn added end pling 07/04/2016 */
 #include "logger.h"
 #include "db.h"
 #include "filescanner.h"
@@ -61,6 +69,7 @@
 #include "player.h"
 #include "cache.h"
 #include "artwork.h"
+#include "commands.h"
 
 #ifdef LASTFM
 # include "lastfm.h"
@@ -69,21 +78,6 @@
 # include "spotify.h"
 #endif
 
-struct filescanner_command;
-
-typedef int (*cmd_func)(struct filescanner_command *cmd);
-
-struct filescanner_command
-{
-  pthread_mutex_t lck;
-  pthread_cond_t cond;
-
-  cmd_func func;
-
-  int nonblock;
-
-  int ret;
-};
 
 #define F_SCAN_BULK    (1 << 0)
 #define F_SCAN_RESCAN  (1 << 1)
@@ -118,17 +112,14 @@ struct stacked_dir {
   struct stacked_dir *next;
 };
 
-static int cmd_pipe[2];
-static int exit_pipe[2];
 static int scan_exit;
 static int inofd;
 static struct event_base *evbase_scan;
 static struct event *inoev;
-static struct event *exitev;
-static struct event *cmdev;
 static pthread_t tid_scan;
 static struct deferred_pl *playlists;
 static struct stacked_dir *dirstack;
+static struct commands_base *cmdbase;
 
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
 struct deferred_file
@@ -167,46 +158,11 @@ static int
 inofd_event_set(void);
 static void
 inofd_event_unset(void);
-static int
-filescanner_initscan(struct filescanner_command *cmd);
-static int
-filescanner_fullrescan(struct filescanner_command *cmd);
+static enum command_state
+filescanner_initscan(void *arg, int *retval);
+static enum command_state
+filescanner_fullrescan(void *arg, int *retval);
 
-
-/* ---------------------------- COMMAND EXECUTION -------------------------- */
-
-static int
-send_command(struct filescanner_command *cmd)
-{
-  int ret;
-
-  if (!cmd->func)
-    {
-      DPRINTF(E_LOG, L_SCAN, "BUG: cmd->func is NULL!\n");
-      return -1;
-    }
-
-  ret = write(cmd_pipe[1], &cmd, sizeof(cmd));
-  if (ret != sizeof(cmd))
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not send command: %s\n", strerror(errno));
-      return -1;
-    }
-
-  return 0;
-}
-
-static int
-nonblock_command(struct filescanner_command *cmd)
-{
-  int ret;
-
-  ret = send_command(cmd);
-  if (ret < 0)
-    return -1;
-
-  return 0;
-}
 
 static int
 push_dir(struct stacked_dir **s, char *path, int parent_id)
@@ -637,6 +593,7 @@ fixup_tags(struct media_file_info *mfi)
     sort_tag_create(&mfi->composer_sort, mfi->composer);
 }
 
+int static file_number=0;
 
 void
 filescanner_process_media(char *path, time_t mtime, off_t size, int type, struct media_file_info *external_mfi, int dir_id)
@@ -647,6 +604,12 @@ filescanner_process_media(char *path, time_t mtime, off_t size, int type, struct
   int id;
   char virtual_path[PATH_MAX];
   int ret;
+
+  /* Foxconn added start pling 07/04/2016 */
+  /* media files limitation */
+  if (file_number >= MAX_MEDIA_FILE)
+    return;
+  /* Foxconn added end pling 07/04/2016 */
 
   filename = strrchr(path, '/');
   if ((!filename) || (strlen(filename) == 1))
@@ -705,6 +668,37 @@ filescanner_process_media(char *path, time_t mtime, off_t size, int type, struct
 
   if (type & F_SCAN_TYPE_FILE)
     {
+      /* Foxconn added start pling 07/04/2016 */
+      /* Handle music files only */
+#ifdef ONLY_MUSIC_FILE
+      char *ext = strrchr(filename, '.');
+      if (!ext)
+          goto out;
+      else
+      if ((strcmp(ext, ".mp3") != 0)
+        && (strcmp(ext, ".wav") != 0)
+        && (strcmp(ext, ".flac") != 0)
+        && (strcmp(ext, ".asf") != 0)
+        && (strcmp(ext, ".wma") != 0)
+        && (strcmp(ext, ".wmv") != 0)
+        && (strcmp(ext, ".m4a") != 0)
+        && (strcmp(ext, ".f4v") != 0)
+        && (strcmp(ext, ".aac") != 0)
+        && (strcmp(ext, ".amr") != 0)
+        && (strcmp(ext, ".awb") != 0)
+        && (strcmp(ext, ".au4") != 0)
+        && (strcmp(ext, ".mov") != 0)
+        && (strcmp(ext, ".m4v") != 0)
+        && (strcmp(ext, ".mp4") != 0))
+      {
+        DPRINTF(E_LOG, L_SCAN, "Ignore file ext %s (%s)\n", ext, filename);
+        goto out;
+      }
+      DPRINTF(E_LOG, L_SCAN, "SCAN file ext %s (%s)\n", ext, filename);
+
+#endif
+      /* Foxconn added end pling 07/04/2016 */
+
       mfi->data_kind = DATA_KIND_FILE;
       ret = scan_metadata_ffmpeg(path, mfi);
     }
@@ -772,6 +766,8 @@ filescanner_process_media(char *path, time_t mtime, off_t size, int type, struct
     }
 
   mfi->directory_id = dir_id;
+
+  file_number++;  /* Foxconn added pling 07/04/2016, media file limitation */
 
   if (mfi->id == 0)
     db_file_add(mfi);
@@ -855,6 +851,19 @@ static void
 process_file(char *file, time_t mtime, off_t size, int type, int flags, int dir_id)
 {
   int is_bulkscan;
+  int ret;
+
+  /* Foxconn added start pling 07/04/2016 */
+  /* Look for remote pairing file first, to speed up pairing */
+  if (access(REMOTE_NOTIFY_FILE,R_OK) != -1)
+  {
+    if (access(REMOTE_PAIRING_FILE,R_OK) != -1)
+    {
+      remote_pairing_read_pin(REMOTE_PAIRING_FILE);
+    }
+    unlink(REMOTE_NOTIFY_FILE);
+  }
+  /* Foxconn added end pling 07/04/2016 */
 
   is_bulkscan = (flags & F_SCAN_BULK);
 
@@ -924,7 +933,7 @@ process_file(char *file, time_t mtime, off_t size, int type, int flags, int dir_
 
 	DPRINTF(E_LOG, L_SCAN, "Startup rescan triggered, found init-rescan file: %s\n", file);
 
-	filescanner_initscan(NULL);
+	filescanner_initscan(NULL, &ret);
 	break;
 
       case FILE_CTRL_FULLSCAN:
@@ -933,7 +942,7 @@ process_file(char *file, time_t mtime, off_t size, int type, int flags, int dir_
 
 	DPRINTF(E_LOG, L_SCAN, "Full rescan triggered, found full-rescan file: %s\n", file);
 
-	filescanner_fullrescan(NULL);
+	filescanner_fullrescan(NULL, &ret);
 	break;
 
       default:
@@ -1087,12 +1096,12 @@ process_directory(char *path, int parent_id, int flags)
 
       if (S_ISREG(sb.st_mode))
 	{
-	  if (!(flags & F_SCAN_FAST))
+	  if (!(flags & F_SCAN_FAST) && file_number<MAX_MEDIA_FILE) /* Foxconn modified pling 07/04/2016, media files limitation */
 	    process_file(entry, sb.st_mtime, sb.st_size, F_SCAN_TYPE_FILE | type, flags, dir_id);
 	}
       else if (S_ISFIFO(sb.st_mode))
 	{
-	  if (!(flags & F_SCAN_FAST))
+	  if (!(flags & F_SCAN_FAST) && file_number<MAX_MEDIA_FILE) /* Foxconn modified pling 07/04/2016, media files limitation */
 	    process_file(entry, sb.st_mtime, sb.st_size, F_SCAN_TYPE_PIPE | type, flags, dir_id);
 	}
       else if (S_ISDIR(sb.st_mode))
@@ -1176,7 +1185,8 @@ process_directories(char *root, int parent_id, int flags)
 
   while ((dir = pop_dir(&dirstack)))
     {
-      process_directory(dir->path, dir->parent_id, flags);
+      if (file_number < MAX_MEDIA_FILE) /* Foxconn added pling 07/04/2016, media files limitation */
+        process_directory(dir->path, dir->parent_id, flags);
 
       free(dir->path);
       free(dir);
@@ -1234,6 +1244,12 @@ bulk_scan(int flags)
 	  continue;
 	}
 
+    /* Foxconn added start pling 07/04/2016 */
+    /* Check remote pairing file first */
+    if (access(REMOTE_PAIRING_FILE,F_OK) == 0)
+      remote_pairing_read_pin(REMOTE_PAIRING_FILE);
+    /* Foxconn added end pling 07/04/2016 */
+
       counter = 0;
       db_transaction_begin();
 
@@ -1274,7 +1290,7 @@ bulk_scan(int flags)
       db_purge_cruft(start);
       cache_artwork_purge_cruft(start);
 
-      DPRINTF(E_LOG, L_SCAN, "Bulk library scan completed in %.f sec\n", difftime(end, start));
+      DPRINTF(E_LOG, L_SCAN, "Bulk library scan completed in %.f sec. Scanned %d files\n", difftime(end, start), file_number);
 
       DPRINTF(E_DBG, L_SCAN, "Running post library scan jobs\n");
       db_hook_post_scan();
@@ -1960,49 +1976,9 @@ inofd_event_unset(void)
 }
 
 /* Thread: scan */
-static void
-exit_cb(int fd, short event, void *arg)
-{
-  event_base_loopbreak(evbase_scan);
 
-  scan_exit = 1;
-}
-
-static void
-command_cb(int fd, short what, void *arg)
-{
-  struct filescanner_command *cmd;
-  int ret;
-
-  ret = read(cmd_pipe[0], &cmd, sizeof(cmd));
-  if (ret != sizeof(cmd))
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not read command! (read %d): %s\n", ret, (ret < 0) ? strerror(errno) : "-no error-");
-      goto readd;
-    }
-
-  if (cmd->nonblock)
-    {
-      cmd->func(cmd);
-
-      free(cmd);
-      goto readd;
-    }
-
-  pthread_mutex_lock(&cmd->lck);
-
-  ret = cmd->func(cmd);
-  cmd->ret = ret;
-
-  pthread_cond_signal(&cmd->cond);
-  pthread_mutex_unlock(&cmd->lck);
-
- readd:
-  event_add(cmdev, NULL);
-}
-
-static int
-filescanner_initscan(struct filescanner_command *cmd)
+static enum command_state
+filescanner_initscan(void *arg, int *retval)
 {
   DPRINTF(E_LOG, L_SCAN, "Startup rescan triggered\n");
 
@@ -2012,11 +1988,12 @@ filescanner_initscan(struct filescanner_command *cmd)
   inofd_event_set();
   bulk_scan(F_SCAN_BULK | F_SCAN_RESCAN);
 
-  return 0;
+  *retval = 0;
+  return COMMAND_END;
 }
 
-static int
-filescanner_fullrescan(struct filescanner_command *cmd)
+static enum command_state
+filescanner_fullrescan(void *arg, int *retval)
 {
   DPRINTF(E_LOG, L_SCAN, "Full rescan triggered\n");
 
@@ -2028,62 +2005,32 @@ filescanner_fullrescan(struct filescanner_command *cmd)
   inofd_event_set();
   bulk_scan(F_SCAN_BULK);
 
-  return 0;
+  *retval = 0;
+  return COMMAND_END;
 }
 
 void
 filescanner_trigger_initscan(void)
 {
-  struct filescanner_command *cmd;
-
   if (scanning)
     {
       DPRINTF(E_INFO, L_SCAN, "Scan already running, ignoring request to trigger a new init scan\n");
       return;
     }
 
-
-  cmd = (struct filescanner_command *)malloc(sizeof(struct filescanner_command));
-  if (!cmd)
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not allocate cache_command\n");
-      return;
-    }
-
-  memset(cmd, 0, sizeof(struct filescanner_command));
-
-  cmd->nonblock = 1;
-
-  cmd->func = filescanner_initscan;
-
-  nonblock_command(cmd);
+ commands_exec_async(cmdbase, filescanner_initscan, NULL);
 }
 
 void
 filescanner_trigger_fullrescan(void)
 {
-  struct filescanner_command *cmd;
-
   if (scanning)
     {
       DPRINTF(E_INFO, L_SCAN, "Scan already running, ignoring request to trigger a new init scan\n");
       return;
     }
 
-  cmd = (struct filescanner_command *)malloc(sizeof(struct filescanner_command));
-  if (!cmd)
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not allocate cache_command\n");
-      return;
-    }
-
-  memset(cmd, 0, sizeof(struct filescanner_command));
-
-  cmd->nonblock = 1;
-
-  cmd->func = filescanner_fullrescan;
-
-  nonblock_command(cmd);
+  commands_exec_async(cmdbase, filescanner_fullrescan, NULL);
 }
 
 /*
@@ -2113,48 +2060,13 @@ filescanner_init(void)
       return -1;
     }
 
-#ifdef HAVE_PIPE2
-  ret = pipe2(exit_pipe, O_CLOEXEC);
-#else
-  ret = pipe(exit_pipe);
-#endif
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_SCAN, "Could not create pipe: %s\n", strerror(errno));
-
-      goto pipe_fail;
-    }
-
-  exitev = event_new(evbase_scan, exit_pipe[0], EV_READ, exit_cb, NULL);
-  if (!exitev || (event_add(exitev, NULL) < 0))
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not create/add command event\n");
-      goto exitev_fail;
-    }
-
   ret = inofd_event_set();
   if (ret < 0)
     {
       goto ino_fail;
     }
 
-#ifdef HAVE_PIPE2
-  ret = pipe2(cmd_pipe, O_CLOEXEC);
-#else
-  ret = pipe(cmd_pipe);
-#endif
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not create command pipe: %s\n", strerror(errno));
-      goto cmd_fail;
-    }
-
-  cmdev = event_new(evbase_scan, cmd_pipe[0], EV_READ, command_cb, NULL);
-  if (!cmdev || (event_add(cmdev, NULL) < 0))
-    {
-      DPRINTF(E_LOG, L_SCAN, "Could not create/add command event\n");
-      goto cmd_fail;
-    }
+  cmdbase = commands_base_new(evbase_scan, NULL);
 
   ret = pthread_create(&tid_scan, NULL, filescanner, NULL);
   if (ret != 0)
@@ -2173,15 +2085,9 @@ filescanner_init(void)
   return 0;
 
  thread_fail:
- cmd_fail:
-  close(cmd_pipe[0]);
-  close(cmd_pipe[1]);
+  commands_base_free(cmdbase);
   close(inofd);
- exitev_fail:
  ino_fail:
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
- pipe_fail:
   event_base_free(evbase_scan);
 
   return -1;
@@ -2192,17 +2098,9 @@ void
 filescanner_deinit(void)
 {
   int ret;
-  int dummy = 42;
-
-  ret = write(exit_pipe[1], &dummy, sizeof(dummy));
-  if (ret != sizeof(dummy))
-    {
-      DPRINTF(E_FATAL, L_SCAN, "Could not write to exit fd: %s\n", strerror(errno));
-
-      return;
-    }
 
   scan_exit = 1;
+  commands_base_destroy(cmdbase);
 
   ret = pthread_join(tid_scan, NULL);
   if (ret != 0)
@@ -2214,9 +2112,5 @@ filescanner_deinit(void)
 
   inofd_event_unset();
 
-  close(exit_pipe[0]);
-  close(exit_pipe[1]);
-  close(cmd_pipe[0]);
-  close(cmd_pipe[1]);
   event_base_free(evbase_scan);
 }
