@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: daapd.h,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Header info for daapd server
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -48,6 +48,7 @@ typedef struct tag_config {
     int stop;             /**< Time to exit? */
     int reload;           /**< Time to reload and/or rescan the database? */
     char *configfile;     /**< path to config file */
+    char *iface;          /**< interface to advertise on */
     char *web_root;       /**< path to the directory containing the admin-root files */
     int port;             /**< port to listen on */
     int rescan_interval;  /**< How often to do a background rescan of the file system */

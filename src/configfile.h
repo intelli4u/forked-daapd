@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: configfile.h,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Functions for reading and writing the config file
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

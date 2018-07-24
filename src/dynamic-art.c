@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: dynamic-art.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Dynamically merge .jpeg data into an mp3 tag
  *
  * Copyright (C) 2004 Hiren Joshi (hirenj@mooh.org)

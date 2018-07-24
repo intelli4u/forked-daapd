@@ -1,6 +1,6 @@
 %{ 
 
-/* $Id$
+/* $Id: lexer.l,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Simple playlist lexer
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: playlist.c,v 1.1 2009-06-30 02:31:09 steven Exp $
  * iTunes-style smart playlists
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -55,7 +55,7 @@ extern FILE *yyin;
  */
 void pl_dump(void) {
     SMART_PLAYLIST *pcurrent=pl_smart.next;
-    
+
     while(pcurrent) {
 	printf("Playlist %s:\n",pcurrent->name);
 	pl_dump_node(pcurrent->root,1);
@@ -66,7 +66,7 @@ void pl_dump(void) {
 /*
  * pl_dump_node
  *
- * recursively dump a node 
+ * recursively dump a node
  */
 void pl_dump_node(PL_NODE *pnode, int indent) {
     int index;
@@ -140,7 +140,7 @@ void pl_dump_node(PL_NODE *pnode, int indent) {
     }
 
     boolarg=(pnode->op) & 0x7FFFFFFF;
-    if(pnode->op & 0x80000000) 
+    if(pnode->op & 0x80000000)
 	not=1;
 
     switch(boolarg) {
@@ -326,7 +326,7 @@ int pl_eval_node(MP3FILE *pmp3, PL_NODE *pnode) {
 	ival=pmp3->bpm;
 	break;
     case BITRATE:
-	ival=pmp3->bitrate / 1024; // bitrate in Kbps
+        ival=pmp3->bitrate;
 	break;
     case DATEADDED:
 	ival=pmp3->time_added;
@@ -341,7 +341,7 @@ int pl_eval_node(MP3FILE *pmp3, PL_NODE *pnode) {
 	not=1;
 
     if(pnode->type==T_STR) {
-	if(!cval) 
+        if(!cval)
 	    cval = "";
 
 	DPRINTF(E_DBG,L_PL,"Matching %s to %s\n",cval,pnode->arg2.cval);

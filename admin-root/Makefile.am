@@ -1,4 +1,4 @@
-# $Id$
+# $Id: Makefile.am,v 1.1 2009-06-30 02:31:07 steven Exp $
 #
 
 adminrootdir = ${pkgdatadir}/admin-root

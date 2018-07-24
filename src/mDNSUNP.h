@@ -22,7 +22,10 @@
 
     Change History (most recent first):
 
-$Log$
+$Log: mDNSUNP.h,v $
+Revision 1.1  2009-06-30 02:31:08  steven
+iTune Server
+
 Revision 1.3  2005/01/10 18:11:29  rpedde
 Fix compile error on solaris
 

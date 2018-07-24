@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: daap-proto.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Helper functions for formatting a daap message
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

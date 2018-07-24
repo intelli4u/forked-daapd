@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: err.h,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Error related routines
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

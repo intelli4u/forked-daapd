@@ -1,7 +1,7 @@
 %{
 
 
-/* $Id$
+/* $Id: parser.y,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Simple playlist parser
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

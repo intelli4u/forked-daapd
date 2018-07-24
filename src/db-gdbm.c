@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: db-gdbm.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Implementation for simple gdbm db
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

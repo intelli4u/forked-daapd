@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: rend.h,v 1.1 2009-06-30 02:31:09 steven Exp $
  * Rendezvous stuff
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

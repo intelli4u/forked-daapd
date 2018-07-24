@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: db-memory.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Implementation for simple in-memory linked list db
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -122,7 +122,7 @@ void db_init_once(void) {
  *
  * We'll wait for db_init
  */
-void db_open(char *parameters) {
+int db_open(char *parameters) {
     return 0;
 }
 

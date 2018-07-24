@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: ogg.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Ogg parsing routines.
  *
  * This file has been modified from the 'ogginfo' code in the vorbistools

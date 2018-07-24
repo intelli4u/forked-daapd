@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: err.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Generic error handling
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

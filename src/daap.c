@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: daap.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Build daap structs for replies
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -770,25 +770,27 @@ DAAP_BLOCK *daap_response_dbinfo(char *name) {
 DAAP_BLOCK *daap_response_server_info(char *name, char *client_version) {
     DAAP_BLOCK *root;
     int g=1;
+    int mpro = 2 << 16;
+    int apro = 3 << 16;
 
     DPRINTF(E_DBG,L_DAAP,"Preparing to send server-info for client ver %s\n",client_version);
 
     root=daap_add_empty(NULL,"msrv");
 
     if(root) {
-	g = (int)daap_add_int(root,"mstt",200); /* result */
-	if((!client_version)||(!strcmp(client_version,"3.0"))) {
-	    g = g && daap_add_int(root,"mpro",2 << 16); /* dmap proto ? */
-	    g = g && daap_add_int(root,"apro",3 << 16); /* daap protocol */
-	} else {
-	    if(!strcmp(client_version,"1.0")) {
-		g = g && daap_add_int(root,"mpro",1 << 16); /* dmap proto ? */
-		g = g && daap_add_int(root,"apro",1 << 16); /* daap protocol */
-	    } else if(!strcmp(client_version,"2.0")) {
-		g = g && daap_add_int(root,"mpro",1 << 16); /* dmap proto ? */
-		g = g && daap_add_int(root,"apro",2 << 16); /* daap protocol */
-	    }
+	if((client_version) && (!strcmp(client_version,"1.0"))) {
+	    mpro = 1 << 16;
+	    apro = 1 << 16;
 	}
+
+	if((client_version) && (!strcmp(client_version,"2.0"))) {
+	    mpro = 1 << 16;
+	    apro = 2 << 16;
+	}
+
+	g = (int)daap_add_int(root,"mstt",200); /* result */
+	g = g && daap_add_int(root,"mpro",mpro); /* dmap proto ? */
+	g = g && daap_add_int(root,"apro",apro); /* daap protocol */
 
 	g = g && daap_add_string(root,"minm",name); /* server name */
 

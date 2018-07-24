@@ -22,7 +22,16 @@
 
     Change History (most recent first):
 
-$Log$
+$Log: mDNSClientAPI.h,v $
+Revision 1.1  2009-06-30 02:31:08  steven
+iTune Server
+
+Revision 1.4.2.1  2005/09/08 04:15:53  rpedde
+fixes for iTunes 5
+
+Revision 1.5  2005/02/21 08:10:34  rpedde
+integrate server-side conversion patches, -Wall cleanups, AMD64 fixes, and xml-rpc cleanups
+
 Revision 1.4  2005/01/10 01:07:01  rpedde
 Synchronize mDNS to Apples 58.8 drop
 
@@ -523,13 +532,9 @@ typedef   signed char  mDNSs8;
 typedef unsigned char  mDNSu8;
 typedef   signed short mDNSs16;
 typedef unsigned short mDNSu16;
-#if _LP64
-typedef   signed int   mDNSs32;
-typedef unsigned int   mDNSu32;
-#else
-typedef   signed long  mDNSs32;
-typedef unsigned long  mDNSu32;
-#endif
+#include <sys/types.h>
+typedef int32_t    mDNSs32;
+typedef u_int32_t  mDNSu32;
 
 // To enforce useful type checking, we make mDNSInterfaceID be a pointer to a dummy struct
 // This way, mDNSInterfaceIDs can be assigned, and compared with each other, but not with other types

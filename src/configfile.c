@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: configfile.c,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Functions for reading and writing the config file
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -27,7 +27,7 @@
  */
 
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#include "config.h"
 #endif
 
 #define _POSIX_PTHREAD_SEMANTICS
@@ -116,6 +116,7 @@ CONFIGELEMENT config_elements[] = {
     { 1,0,0,CONFIG_TYPE_INT,"compress",(void*)&config.compress,config_emit_int },
     { 1,0,0,CONFIG_TYPE_STRING,"playlist",(void*)&config.playlist,config_emit_string },
     { 1,0,0,CONFIG_TYPE_STRING,"extensions",(void*)&config.extensions,config_emit_string },
+    { 1,0,0,CONFIG_TYPE_STRING,"interface",(void*)&config.iface,config_emit_string },
     { 1,0,0,CONFIG_TYPE_STRING,"password",(void*)&config.readpassword, config_emit_string },
     { 1,0,0,CONFIG_TYPE_STRING,"logfile",(void*)&config.logfile, config_emit_string },
     { 0,0,0,CONFIG_TYPE_SPECIAL,"release",(void*)VERSION,config_emit_literal },
@@ -262,6 +263,7 @@ int config_read(char *file) {
     config.web_root=NULL;
     config.adminpassword=NULL;
     config.readpassword=NULL;
+    config.iface=NULL;
     config.mp3dir=NULL;
     config.playlist=NULL;
     config.runas=NULL;
@@ -1229,7 +1231,7 @@ void config_emit_version(WS_CONNINFO *pwsc, void *value, char *arg) {
  * \param arg any args passwd with the meta command.  Unused.
  */
 void config_emit_system(WS_CONNINFO *pwsc, void *value, char *arg) {
-    ws_writefd(pwsc,"%s",HOST);
+    ws_writefd(pwsc,"%s","Ralink");
 }
 
 

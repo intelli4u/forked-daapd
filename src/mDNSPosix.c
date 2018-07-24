@@ -35,7 +35,10 @@
 
 	Change History (most recent first):
 
-$Log$
+$Log: mDNSPosix.c,v $
+Revision 1.1  2009-06-30 02:31:08  steven
+iTune Server
+
 Revision 1.5  2005/01/10 01:07:01  rpedde
 Synchronize mDNS to Apples 58.8 drop
 

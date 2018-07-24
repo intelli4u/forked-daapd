@@ -1,4 +1,4 @@
-static char rcsid[]="$Id$";
+static char rcsid[]="$Id: redblack.c,v 1.1 2009-06-30 02:31:09 steven Exp $";
 
 /*
    Redblack balanced tree algorithm
@@ -1086,7 +1086,10 @@ RB_ENTRY(dumptree)(struct RB_ENTRY(node) *x, int n)
 #endif
 
 /*
- * $Log$
+ * $Log: redblack.c,v $
+ * Revision 1.1  2009-06-30 02:31:09  steven
+ * iTune Server
+ *
  * Revision 1.1  2004/03/13 23:43:02  rpedde
  * Add Damian Ivereigh's redblack tree implementation to speed lookups
  *

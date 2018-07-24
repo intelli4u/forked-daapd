@@ -22,7 +22,19 @@
 
     Change History (most recent first):
 
-$Log$
+$Log: mDNSUNP.c,v $
+Revision 1.1  2009-06-30 02:31:08  steven
+iTune Server
+
+Revision 1.2.2.3  2005/09/11 19:13:48  rpedde
+mdns fix for freebsd
+
+Revision 1.2.2.2  2005/09/10 17:45:20  rpedde
+Fixes for fbsd
+
+Revision 1.2.2.1  2005/09/08 06:57:51  rpedde
+Update to 0.2.2, fix amd64
+
 Revision 1.2  2005/01/10 01:07:01  rpedde
 Synchronize mDNS to Apples 58.8 drop
 
@@ -152,7 +164,20 @@ struct ifi_info *get_ifi_info(int family, int doaliases)
         ifr = (struct ifreq *) ptr;
 
 		len = GET_SA_LEN(ifr->ifr_addr);
-        ptr += sizeof(ifr->ifr_name) + len; /* for next one in buffer */
+
+		/* This is completely whacked, and I really need to
+		 * find out why this is the case, but I need to
+		 * release a 0.2.2, and as the next stable won't
+		 * have the apple mDNS included, I guess it's a
+		 * small price to pay.
+		 */
+#ifdef FREEBSD
+		    ptr += sizeof(ifr->ifr_name) + len; /* for next one in buffer */
+		//		ptr += sizeof(*ifr);
+#else
+
+		    ptr += sizeof(struct ifreq); /* for next one in buffer */
+#endif
     
 //        fprintf(stderr, "intf %d name=%s AF=%d\n", index, ifr->ifr_name, ifr->ifr_addr.sa_family);
         

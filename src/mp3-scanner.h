@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: mp3-scanner.h,v 1.1 2009-06-30 02:31:08 steven Exp $
  * Header file for mp3 scanner and monitor
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

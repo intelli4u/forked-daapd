@@ -1,3 +1,23 @@
+mt-daapd (0.2.5-1) unstable; urgency=low
+  * Fix for iTunes 6.0.5
+
+ -- Ron Pedde <ron@pedde.com>  Tue,  4 Jul 2006 01:50:00 -0600
+
+mt-daapd (0.2.4-1) unstable; urgency=low
+  * Fix for iTunes 6.0.4
+
+ -- Ron Pedde <ron@pedde.com>  Wed,  1 Mar 2006 18:48:00 -0600
+
+mt-daapd (0.2.3-1) unstable; urgency=low
+  * Fix mDNS advertising on amd64 and freebsd in 0.2.2
+
+ -- Ron Pedde <ron@pedde.com>  Sun, 11 Sep 2005 14:09:00 -0500
+	
+mt-daapd (0.2.2-1) unstable; urgency=low
+  * Fixes for iTunes 5
+
+ -- Ron Pedde <ron@pedde.com>  Thu,  8 Sep 2005 01:55:00 -0500
+	
 mt-daapd (0.2.1.1-1) unstable; urgency=low
   * Trivial fixes for stupid bugs
 

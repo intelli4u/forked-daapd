@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: rend-howl.c,v 1.1 2009-06-30 02:31:09 steven Exp $
  * Rendezvous for SwampWolf's Howl (http://www.swampwolf.com)
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -156,8 +156,8 @@ void rend_callback(void) {
 					NULL, /* domain */
 					NULL, /* host */
 					msg.port,
-					"\034Database ID=beddab1edeadbea7", /* text record */
-					29, /* text record length */
+					"\011txtvers=1\034Database ID=beddab1edeadbea7", /* text record */
+					39, /* text record length */
 					rend_howl_reply,
 					NULL,
 					&rend_oid)) != SW_OKAY) {

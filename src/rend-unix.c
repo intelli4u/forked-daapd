@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: rend-unix.c,v 1.1 2009-06-30 02:31:09 steven Exp $
  * General unix rendezvous routines
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -91,9 +91,9 @@ int rend_init(char *user) {
     signal(SIGTSTP, SIG_IGN);
 
 #ifdef SETPGRP_VOID
-    setpgrp();
+   setpgrp();
 #else
-    setpgrp(0,0);
+   setpgrp(0,0);
 #endif
 
 #ifdef TIOCNOTTY

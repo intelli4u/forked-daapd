@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: rend-posix.c,v 1.1 2009-06-30 02:31:09 steven Exp $
  *
  * Do the zeroconf/mdns/rendezvous (tm) thing.  This is a hacked version
  * of Apple's Responder.c from the Rendezvous (tm) POSIX implementation
@@ -88,7 +88,10 @@
 
   Change History (most recent first):
 
- $Log$
+ $Log: rend-posix.c,v $
+ Revision 1.1  2009-06-30 02:31:09  steven
+ iTune Server
+
  Revision 1.23  2005/01/07 06:57:59  rpedde
  fix minor errno problem
 
@@ -414,7 +417,7 @@ void rend_callback(void) {
     switch(msg.cmd) {
     case REND_MSG_TYPE_REGISTER:
 	DPRINTF(E_DBG,L_REND,"Registering %s.%s (%d)\n",msg.name,msg.type,msg.port);
-	RegisterOneService(msg.name,msg.type,"local.","\034Database ID=beddab1edeadbea7",29,
+	RegisterOneService(msg.name,msg.type,"local.","\011txtvers=1\034Database ID=beddab1edeadbea7",39,
 			   msg.port);
 	rend_send_response(0); /* success */
 	break;

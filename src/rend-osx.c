@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: rend-osx.c,v 1.1 2009-06-30 02:31:09 steven Exp $
  * Rendezvous - OSX style
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)
@@ -77,8 +77,8 @@ static int rend_addtorunloop(dns_service_discovery_ref client) {
     else {
 	CFMachPortContext context = { 0, 0, NULL, NULL, NULL };
 	Boolean shouldFreeInfo;
-	CFMachPortRef cfMachPort=CFMachPortCreateWithPort(kCFAllocatorDefault, 
-							  port, rend_handler, 
+        CFMachPortRef cfMachPort=CFMachPortCreateWithPort(kCFAllocatorDefault,
+                                                          port, rend_handler,
 							  &context, &shouldFreeInfo);
 
 	CFRunLoopSourceRef rls=CFMachPortCreateRunLoopSource(NULL,cfMachPort,0);
@@ -151,7 +151,7 @@ void rend_add_text(char *buffer, char *string) {
 /*
  * rend_callback
  *
- * This gets called from the main thread when there is a 
+ * This gets called from the main thread when there is a
  * message waiting to be processed.
  */
 void rend_callback(void *info) {
@@ -168,9 +168,9 @@ void rend_callback(void *info) {
     switch(msg.cmd) {
     case REND_MSG_TYPE_REGISTER:
 	DPRINTF(E_DBG,L_REND,"Registering %s.%s (%d)\n",msg.type,msg.name,msg.port);
-	usPort=msg.port;
+        usPort=htons(msg.port);
 	dns_ref=DNSServiceRegistrationCreate(msg.name,msg.type,"",usPort,
-					     "Database ID=bedabb1edeadbea7",rend_reply,nil);
+					     "txtvers=1\001Database ID=bedabb1edeadbea7",rend_reply,nil);
 	if(rend_addtorunloop(dns_ref)) {
 	    DPRINTF(E_WARN,L_REND,"Add to runloop failed\n");
 	    rend_send_response(-1);
@@ -218,7 +218,7 @@ int rend_private_init(char *user) {
     CFRunLoopAddSource(CFRunLoopGetCurrent(),rend_rls,kCFRunLoopDefaultMode);
 
     DPRINTF(E_DBG,L_REND,"Starting polling thread\n");
-    
+
     if(pthread_create(&rend_tid,NULL,rend_pipe_monitor,NULL)) {
 	DPRINTF(E_FATAL,L_REND,"Could not start thread.  Terminating\n");
 	/* should kill parent, too */

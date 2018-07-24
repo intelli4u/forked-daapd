@@ -43,7 +43,10 @@
 
     Change History (most recent first):
 
-$Log$
+$Log: mDNS.c,v $
+Revision 1.1  2009-06-30 02:31:08  steven
+iTune Server
+
 Revision 1.2  2005/01/10 01:07:00  rpedde
 Synchronize mDNS to Apples 58.8 drop
 

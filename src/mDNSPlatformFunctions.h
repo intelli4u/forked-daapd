@@ -22,7 +22,10 @@
 
     Change History (most recent first):
 
-$Log$
+$Log: mDNSPlatformFunctions.h,v $
+Revision 1.1  2009-06-30 02:31:08  steven
+iTune Server
+
 Revision 1.2  2005/01/10 01:07:01  rpedde
 Synchronize mDNS to Apples 58.8 drop
 

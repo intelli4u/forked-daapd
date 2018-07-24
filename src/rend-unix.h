@@ -1,5 +1,5 @@
 /*
- * $Id$
+ * $Id: rend-unix.h,v 1.1 2009-06-30 02:31:09 steven Exp $
  * General unix rendezvous routines
  *
  * Copyright (C) 2003 Ron Pedde (ron@pedde.com)

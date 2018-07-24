@@ -1,5 +1,5 @@
 /*
- * RCS $Id$
+ * RCS $Id: redblack.h,v 1.1 2009-06-30 02:31:09 steven Exp $
  */
 
 /*
@@ -137,7 +137,10 @@ RB_STATIC void RB_ENTRY(closelist)(RBLIST *);
 
 /*
  *
- * $Log$
+ * $Log: redblack.h,v $
+ * Revision 1.1  2009-06-30 02:31:09  steven
+ * iTune Server
+ *
  * Revision 1.1  2004/03/13 23:43:02  rpedde
  * Add Damian Ivereigh's redblack tree implementation to speed lookups
  *
