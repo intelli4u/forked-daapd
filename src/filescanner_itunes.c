@@ -28,16 +28,16 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 #include <sys/mman.h>
 
 #include <stdint.h>
 #include <inttypes.h>
 
-#include <avl.h>
 #include <plist/plist.h>
 
-#include "evhttp/evhttp.h"
+#include <event2/http.h>
 
 #include "logger.h"
 #include "db.h"
@@ -46,11 +46,17 @@
 #include "misc.h"
 
 
-/* Mapping between iTunes library IDs and our DB IDs */
+/* Mapping between iTunes library IDs and our DB IDs using a "hash" table of
+ * size ID_MAP_SIZE
+ */
+#define ID_MAP_SIZE 16384
 struct itml_to_db_map {
   uint64_t itml_id;
   uint32_t db_id;
+  struct itml_to_db_map *next;
 };
+struct itml_to_db_map **id_map;
+
 
 /* Mapping between iTunes library metadata keys and the offset
  * of the equivalent metadata field in struct media_file_info */
@@ -84,24 +90,65 @@ static struct metadata_map md_map[] =
     { NULL,           0, 0 }
   };
 
-static avl_tree_t *itml_to_db;
-
-
-static int
-itml_to_db_compare(const void *aa, const void *bb)
+static void
+id_map_free(void)
 {
-  struct itml_to_db_map *a = (struct itml_to_db_map *)aa;
-  struct itml_to_db_map *b = (struct itml_to_db_map *)bb;
+  struct itml_to_db_map *map;
+  int i;
 
-  if (a->itml_id < b->itml_id)
+  for (i = 0; i < ID_MAP_SIZE; i++)
+    {
+      if (!id_map[i])
+	continue;
+
+      for (map = id_map[i]; id_map[i]; map = id_map[i])
+	{
+	  id_map[i] = map->next;
+	  free(map);
+	}
+    }
+
+  free(id_map);
+}
+
+/* Inserts a linked list item into "hash" position in the id_table */
+static int
+id_map_add(uint64_t itml_id, uint32_t db_id)
+{
+  struct itml_to_db_map *new_map;
+  struct itml_to_db_map *cur_map;
+  int i;
+
+  new_map = malloc(sizeof(struct itml_to_db_map));
+  if (!new_map)
     return -1;
 
-  if (a->itml_id > b->itml_id)
-    return 1;
+  new_map->itml_id = itml_id;
+  new_map->db_id = db_id;
+
+  i = itml_id % ID_MAP_SIZE;
+  cur_map = id_map[i];
+  new_map->next = cur_map;
+  id_map[i] = new_map;
 
   return 0;
 }
 
+static uint32_t
+id_map_get(uint64_t itml_id)
+{
+  struct itml_to_db_map *map;
+  int i;
+
+  i = itml_id % ID_MAP_SIZE;
+  for (map = id_map[i]; map; map = map->next)
+    {
+      if (itml_id == map->itml_id)
+	return map->db_id;
+    }
+
+  return 0;
+}
 
 /* plist helpers */
 static int
@@ -260,79 +307,71 @@ check_meta(plist_t dict)
   return 0;
 }
 
-
-/* Best-effort attempt at locating the file:
- *  - first exact location given in itml
- *  - somewhere under the location of itml
- *  - anywhere (filename only)
- */
 static int
-find_track_file(char *location, char *base)
+find_track_file(char *location)
 {
-  char *filename;
+  int ret;
   int plen;
   int mfi_id;
+  char *entry;
+  char *ptr;
 
   location = evhttp_decode_uri(location);
-
-  plen = strlen("file://localhost/");
-
-  /* Not a local file ... */
-  if (strncmp(location, "file://localhost/", plen) != 0)
-    return 0;
-
-  /* Windows pathspec, from iTunes Win32 */
-  if (location[plen + 1] == ':')
-    plen += 2;
-  else
-    plen -= 1;
-
-  /* Try exact path first */
-  filename = m_realpath(location + plen);
-  if (filename)
+  if (!location)
     {
-      mfi_id = db_file_id_bypath(filename);
+      DPRINTF(E_LOG, L_SCAN, "Could not decode iTunes XML playlist url.\n");
 
-      free(filename);
-
-      if (mfi_id > 0)
-	{
-	  free(location);
-
-	  return mfi_id;
-	}
+      return 0;
     }
 
-  filename = strrchr(location, '/');
-  if (!filename)
+  plen = strlen("file://");
+
+  /* Not a local file ... */
+  if (strncmp(location, "file://", plen) != 0)
+    return 0;
+
+  /* Now search for the library item where the path has closest match to playlist item */
+  /* Succes is when we find an unambiguous match, or when we no longer can expand the  */
+  /* the path to refine our search.                                                    */
+  entry = NULL;
+  do
     {
-      DPRINTF(E_WARN, L_SCAN, "Could not extract filename from location\n");
+      ptr = strrchr(location, '/');
+      if (entry)
+	*(entry - 1) = '/';
+      if (ptr)
+	{
+	  *ptr = '\0';
+	  entry = ptr + 1;
+	}
+      else
+	entry = location;
+
+      DPRINTF(E_SPAM, L_SCAN, "iTunes XML playlist entry is now %s\n", entry);
+      ret = db_files_get_count_bymatch(entry);
+
+    } while (ptr && (ret > 1));
+
+  if (ret > 0)
+    {
+      mfi_id = db_file_id_bymatch(entry);
+      DPRINTF(E_DBG, L_SCAN, "Found iTunes XML playlist entry match, id is %d, entry is %s\n", mfi_id, entry);
+
+      free(location);
+      return mfi_id;
+    }
+  else
+    {
+      DPRINTF(E_DBG, L_SCAN, "No match for iTunes XML playlist entry %s\n", entry);
 
       free(location);
       return 0;
     }
 
-  filename++;
-
-  /* Try to locate the file under the playlist location */
-  mfi_id = db_file_id_byfilebase(filename, base);
-  if (mfi_id > 0)
-    {
-      free(location);
-
-      return mfi_id;
-    }
-
-  /* Last resort, filename only */
-  mfi_id = db_file_id_byfile(filename);
-
-  free(location);
-
-  return mfi_id;
 }
 
 static int
-process_track_file(plist_t trk, char *base)
+process_track_file(plist_t trk)
 {
   char *location;
   struct media_file_info *mfi;
@@ -354,7 +393,7 @@ process_track_file(plist_t trk, char *base)
       return 0;
     }
 
-  mfi_id = find_track_file(location, base);
+  mfi_id = find_track_file(location);
 
   if (mfi_id <= 0)
     {
@@ -427,6 +466,13 @@ process_track_file(plist_t trk, char *base)
 	}
     }
 
+  /* Set media_kind to 4 (Podcast) if Podcast is true */
+  ret = get_dictval_bool_from_key(trk, "Podcast", &boolean); 
+  if ((ret == 0) && boolean)
+    {
+      mfi->media_kind = MEDIA_KIND_PODCAST;
+    }
+
   /* Don't let album_artist set to "Unknown artist" if we've
    * filled artist from the iTunes data in the meantime
    */
@@ -466,12 +512,10 @@ process_track_stream(plist_t trk)
 }
 
 static int
-process_tracks(plist_t tracks, char *base)
+process_tracks(plist_t tracks)
 {
   plist_t trk;
   plist_dict_iter iter;
-  struct itml_to_db_map *map;
-  avl_node_t *mapnode;
   char *str;
   uint64_t trk_id;
   uint8_t disabled;
@@ -537,7 +581,7 @@ process_tracks(plist_t tracks, char *base)
       if (strcmp(str, "URL") == 0)
 	mfi_id = process_track_stream(trk);
       else if (strcmp(str, "File") == 0)
-	mfi_id = process_track_file(trk, base);
+	mfi_id = process_track_file(trk);
       else
 	{
 	  DPRINTF(E_LOG, L_SCAN, "Unknown track type: %s\n", str);
@@ -557,28 +601,9 @@ process_tracks(plist_t tracks, char *base)
 
       ntracks++;
 
-      map = (struct itml_to_db_map *)malloc(sizeof(struct itml_to_db_map));
-      if (!map)
-	{
-	  DPRINTF(E_WARN, L_SCAN, "Out of memory for itml -> db mapping\n");
-
-	  plist_dict_next_item(tracks, iter, NULL, &trk);
-	  continue;
-	}
-
-      map->itml_id = trk_id;
-      map->db_id = mfi_id;
-
-      mapnode = avl_insert(itml_to_db, map);
-      if (!mapnode)
-	{
-	  if (errno == EEXIST)
-	    DPRINTF(E_WARN, L_SCAN, "Track %" PRIu64 " already in itml -> db map?!\n", trk_id);
-	  else
-	    DPRINTF(E_WARN, L_SCAN, "Track %" PRIu64 ": AVL insert error: %s\n", trk_id, strerror(errno));
-
-	  free(map);
-	}
+      ret = id_map_add(trk_id, mfi_id);
+      if (ret < 0)
+	DPRINTF(E_LOG, L_SCAN, "Out of memory for itml -> db mapping\n");
 
       plist_dict_next_item(tracks, iter, NULL, &trk);
     }
@@ -592,10 +617,9 @@ process_tracks(plist_t tracks, char *base)
 static void
 process_pl_items(plist_t items, int pl_id)
 {
-  struct itml_to_db_map needle;
-  struct itml_to_db_map *map;
   plist_t trk;
-  avl_node_t *mapnode;
+  uint64_t itml_id;
+  uint32_t db_id;
   uint32_t alen;
   uint32_t i;
   int ret;
@@ -608,25 +632,23 @@ process_pl_items(plist_t items, int pl_id)
       if (plist_get_node_type(trk) != PLIST_DICT)
 	continue;
 
-      ret = get_dictval_int_from_key(trk, "Track ID", &needle.itml_id);
+      ret = get_dictval_int_from_key(trk, "Track ID", &itml_id);
       if (ret < 0)
 	{
 	  DPRINTF(E_WARN, L_SCAN, "No Track ID found for playlist item %u\n", i);
 	  continue;
 	}
 
-      mapnode = avl_search(itml_to_db, &needle);
-      if (!mapnode)
+      db_id = id_map_get(itml_id);
+      if (!db_id)
 	{
-	  DPRINTF(E_INFO, L_SCAN, "Track ID %" PRIu64 " dropped\n", needle.itml_id);
+	  DPRINTF(E_INFO, L_SCAN, "Track ID %" PRIu64 " dropped\n", itml_id);
 	  continue;
 	}
 
-      map = (struct itml_to_db_map *)mapnode->item;
-
-      ret = db_pl_add_item_byid(pl_id, map->db_id);
+      ret = db_pl_add_item_byid(pl_id, db_id);
       if (ret < 0)
-	DPRINTF(E_WARN, L_SCAN, "Could not add ID %d to playlist\n", map->db_id);
+	DPRINTF(E_WARN, L_SCAN, "Could not add ID %d to playlist\n", db_id);
     }
 }
 
@@ -677,6 +699,7 @@ process_pls(plist_t playlists, char *file)
   int pl_id;
   uint32_t alen;
   uint32_t i;
+  char virtual_path[PATH_MAX];
   int ret;
 
   alen = plist_array_get_size(playlists);
@@ -732,7 +755,23 @@ process_pls(plist_t playlists, char *file)
 
       if (pl_id == 0)
 	{
-	  ret = db_pl_add(name, file, &pl_id);
+	  pli = (struct playlist_info *)malloc(sizeof(struct playlist_info));
+	  if (!pli)
+	    {
+	      DPRINTF(E_LOG, L_SCAN, "Out of memory\n");
+
+	      return;
+	    }
+	  memset(pli, 0, sizeof(struct playlist_info));
+
+	  pli->type = PL_PLAIN;
+	  pli->title = strdup(name);
+	  pli->path = strdup(file);
+	  snprintf(virtual_path, PATH_MAX, "/file:%s", file);
+	  pli->virtual_path = strdup(virtual_path);
+
+	  ret = db_pl_add(pli, &pl_id);
+	  free_pli(pli, 0);
 	  if (ret < 0)
 	    {
 	      DPRINTF(E_LOG, L_SCAN, "Error adding iTunes playlist '%s' (%s)\n", name, file);
@@ -760,14 +799,15 @@ scan_itunes_itml(char *file)
   plist_t itml;
   plist_t node;
   int fd;
+  int size;
   int ret;
 
-  DPRINTF(E_INFO, L_SCAN, "Processing iTunes library: %s\n", file);
+  DPRINTF(E_LOG, L_SCAN, "Processing iTunes library: %s\n", file);
 
   fd = open(file, O_RDONLY);
   if (fd < 0)
     {
-      DPRINTF(E_WARN, L_SCAN, "Could not open iTunes library '%s': %s\n", file, strerror(errno));
+      DPRINTF(E_LOG, L_SCAN, "Could not open iTunes library '%s': %s\n", file, strerror(errno));
 
       return;
     }
@@ -775,7 +815,7 @@ scan_itunes_itml(char *file)
   ret = fstat(fd, &sb);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_SCAN, "Could not stat iTunes library '%s': %s\n", file, strerror(errno));
+      DPRINTF(E_LOG, L_SCAN, "Could not stat iTunes library '%s': %s\n", file, strerror(errno));
 
       close(fd);
       return;
@@ -784,7 +824,7 @@ scan_itunes_itml(char *file)
   itml_xml = mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
   if (itml_xml == MAP_FAILED)
     {
-      DPRINTF(E_WARN, L_SCAN, "Could not map iTunes library: %s\n", strerror(errno));
+      DPRINTF(E_LOG, L_SCAN, "Could not map iTunes library: %s\n", strerror(errno));
 
       close(fd);
       return;
@@ -801,14 +841,14 @@ scan_itunes_itml(char *file)
 
   if (!itml)
     {
-      DPRINTF(E_WARN, L_SCAN, "iTunes XML playlist '%s' failed to parse\n", file);
+      DPRINTF(E_LOG, L_SCAN, "iTunes XML playlist '%s' failed to parse\n", file);
 
       return;
     }
 
   if (plist_get_node_type(itml) != PLIST_DICT)
     {
-      DPRINTF(E_WARN, L_SCAN, "Malformed iTunes XML playlist '%s'\n", file);
+      DPRINTF(E_LOG, L_SCAN, "Malformed iTunes XML playlist '%s'\n", file);
 
       plist_free(itml);
       return;
@@ -826,39 +866,41 @@ scan_itunes_itml(char *file)
   ret = get_dictval_dict_from_key(itml, "Tracks", &node);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_SCAN, "Could not find Tracks dict\n");
+      DPRINTF(E_LOG, L_SCAN, "Could not find Tracks dict\n");
 
       plist_free(itml);
       return;
     }
 
-  itml_to_db = avl_alloc_tree(itml_to_db_compare, free);
-  if (!itml_to_db)
+  size = ID_MAP_SIZE * sizeof(struct itml_to_db_map *);
+  id_map = malloc(size);
+  if (!id_map)
     {
-      DPRINTF(E_FATAL, L_SCAN, "iTunes library parser could not allocate AVL tree\n");
+      DPRINTF(E_FATAL, L_SCAN, "iTunes library parser could not allocate ID map\n");
 
       plist_free(itml);
       return;
     }
+  memset(id_map, 0, size);
 
   ptr = strrchr(file, '/');
   if (!ptr)
     {
       DPRINTF(E_FATAL, L_SCAN, "Invalid filename\n");
 
-      avl_free_tree(itml_to_db);
+      id_map_free();
       plist_free(itml);
       return;
     }
 
   *ptr = '\0';
 
-  ret = process_tracks(node, file);
+  ret = process_tracks(node);
   if (ret <= 0)
     {
-      DPRINTF(E_WARN, L_SCAN, "No tracks loaded\n");
+      DPRINTF(E_LOG, L_SCAN, "No tracks loaded\n");
 
-      avl_free_tree(itml_to_db);
+      id_map_free();
       plist_free(itml);
       return;
     }
@@ -871,15 +913,15 @@ scan_itunes_itml(char *file)
   ret = get_dictval_array_from_key(itml, "Playlists", &node);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_SCAN, "Could not find Playlists dict\n");
+      DPRINTF(E_LOG, L_SCAN, "Could not find Playlists dict\n");
 
-      avl_free_tree(itml_to_db);
+      id_map_free();
       plist_free(itml);
       return;
     }
 
   process_pls(node, file);
 
-  avl_free_tree(itml_to_db);
+  id_map_free();
   plist_free(itml);
 }

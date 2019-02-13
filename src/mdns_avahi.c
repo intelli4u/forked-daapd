@@ -4,7 +4,7 @@
  * Copyright (C) 2009-2011 Julien BLACHE <jb@jblache.org>
  *
  * Pieces coming from mt-daapd:
- * Copyright (C) 2005 Sebastian Dröge <slomo@ubuntu.com>
+ * Copyright (C) 2005 Sebastian DrÃ¶ge <slomo@ubuntu.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,7 +34,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 
-#include <event.h>
+#include <event2/event.h>
 
 #include <avahi-common/watch.h>
 #include <avahi-common/malloc.h>
@@ -56,7 +56,7 @@ static AvahiEntryGroup *mdns_group = NULL;
 
 struct AvahiWatch
 {
-  struct event ev;
+  struct event *ev;
 
   AvahiWatchCallback cb;
   void *userdata;
@@ -66,7 +66,7 @@ struct AvahiWatch
 
 struct AvahiTimeout
 {
-  struct event ev;
+  struct event *ev;
 
   AvahiTimeoutCallback cb;
   void *userdata;
@@ -93,7 +93,7 @@ evcb_watch(int fd, short ev_events, void *arg)
   if (ev_events & EV_WRITE)
     a_events |= AVAHI_WATCH_OUT;
 
-  event_add(&w->ev, NULL);
+  event_add(w->ev, NULL);
 
   w->cb(w, fd, a_events, w->userdata);
 }
@@ -121,10 +121,17 @@ _ev_watch_add(AvahiWatch *w, int fd, AvahiWatchEvent a_events)
   if (a_events & AVAHI_WATCH_OUT)
     ev_events |= EV_WRITE;
 
-  event_set(&w->ev, fd, ev_events, evcb_watch, w);
-  event_base_set(evbase_main, &w->ev);
+  if (w->ev)
+    event_free(w->ev);
 
-  return event_add(&w->ev, NULL);
+  w->ev = event_new(evbase_main, fd, ev_events, evcb_watch, w);
+  if (!w->ev)
+    {
+      DPRINTF(E_LOG, L_MDNS, "Could not make new event in _ev_watch_add\n");
+      return -1;
+    }
+
+  return event_add(w->ev, NULL);
 }
 
 static AvahiWatch *
@@ -158,9 +165,10 @@ ev_watch_new(const AvahiPoll *api, int fd, AvahiWatchEvent a_events, AvahiWatchC
 static void
 ev_watch_update(AvahiWatch *w, AvahiWatchEvent a_events)
 {
-  event_del(&w->ev);
+  if (w->ev)
+    event_del(w->ev);
 
-  _ev_watch_add(w, EVENT_FD(&w->ev), a_events);
+  _ev_watch_add(w, (int)event_get_fd(w->ev), a_events);
 }
 
 static AvahiWatchEvent
@@ -170,9 +178,9 @@ ev_watch_get_events(AvahiWatch *w)
 
   a_events = 0;
 
-  if (event_pending(&w->ev, EV_READ, NULL))
+  if (event_pending(w->ev, EV_READ, NULL))
     a_events |= AVAHI_WATCH_IN;
-  if (event_pending(&w->ev, EV_WRITE, NULL))
+  if (event_pending(w->ev, EV_WRITE, NULL))
     a_events |= AVAHI_WATCH_OUT;
 
   return a_events;
@@ -184,7 +192,11 @@ ev_watch_free(AvahiWatch *w)
   AvahiWatch *prev;
   AvahiWatch *cur;
 
-  event_del(&w->ev);
+  if (w->ev)
+    {
+      event_free(w->ev);
+      w->ev = NULL;
+    }
 
   prev = NULL;
   for (cur = all_w; cur; prev = cur, cur = cur->next)
@@ -211,8 +223,15 @@ _ev_timeout_add(AvahiTimeout *t, const struct timeval *tv)
   struct timeval now;
   int ret;
 
-  evtimer_set(&t->ev, evcb_timeout, t);
-  event_base_set(evbase_main, &t->ev);
+  if (t->ev)
+    event_free(t->ev);
+
+  t->ev = evtimer_new(evbase_main, evcb_timeout, t);
+  if (!t->ev)
+    {
+      DPRINTF(E_LOG, L_MDNS, "Could not make event in _ev_timeout_add - out of memory?\n");
+      return -1;
+    }
 
   if ((tv->tv_sec == 0) && (tv->tv_usec == 0))
     {
@@ -227,7 +246,7 @@ _ev_timeout_add(AvahiTimeout *t, const struct timeval *tv)
       evutil_timersub(tv, &now, &e_tv);
     }
 
-  return evtimer_add(&t->ev, &e_tv);
+  return evtimer_add(t->ev, &e_tv);
 }
 
 static AvahiTimeout *
@@ -265,7 +284,8 @@ ev_timeout_new(const AvahiPoll *api, const struct timeval *tv, AvahiTimeoutCallb
 static void
 ev_timeout_update(AvahiTimeout *t, const struct timeval *tv)
 {
-  event_del(&t->ev);
+  if (t->ev)
+    event_del(t->ev);
 
   if (tv)
     _ev_timeout_add(t, tv);
@@ -277,7 +297,11 @@ ev_timeout_free(AvahiTimeout *t)
   AvahiTimeout *prev;
   AvahiTimeout *cur;
 
-  event_del(&t->ev);
+  if (t->ev)
+    {
+      event_free(t->ev);
+      t->ev = NULL;
+    }
 
   prev = NULL;
   for (cur = all_t; cur; prev = cur, cur = cur->next)
@@ -954,10 +978,18 @@ mdns_deinit(void)
   AvahiTimeout *t;
 
   for (t = all_t; t; t = t->next)
-    event_del(&t->ev);
+    if (t->ev)
+      {
+	event_free(t->ev);
+	t->ev = NULL;
+      }
 
   for (w = all_w; w; w = w->next)
-    event_del(&w->ev);
+    if (w->ev)
+      {
+	event_free(w->ev);
+	w->ev = NULL;
+      }
 
   for (ge = group_entries; group_entries; ge = group_entries)
     {
@@ -1000,11 +1032,14 @@ mdns_register(char *name, char *type, int port, char **txt)
   ge->port = port;
 
   txt_sl = NULL;
-  for (i = 0; txt[i]; i++)
+  if (txt)
     {
-      txt_sl = avahi_string_list_add(txt_sl, txt[i]);
+      for (i = 0; txt[i]; i++)
+	{
+	  txt_sl = avahi_string_list_add(txt_sl, txt[i]);
 
-      DPRINTF(E_DBG, L_MDNS, "Added key %s\n", txt[i]);
+	  DPRINTF(E_DBG, L_MDNS, "Added key %s\n", txt[i]);
+	}
     }
 
   ge->txt = txt_sl;

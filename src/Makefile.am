@@ -1,30 +1,32 @@
 
 sbin_PROGRAMS = forked-daapd
 
-if COND_FLAC
-FLACSRC=scan-flac.c
-endif
-
-if COND_MUSEPACK
-MUSEPACKSRC=scan-mpc.c
-endif
-
 if COND_ITUNES
-ITUNESSRC=filescanner_itunes.c
+ITUNES_SRC=filescanner_itunes.c
+endif
+
+if COND_SPOTIFY
+SPOTIFY_SRC=spotify.c spotify.h
+endif
+
+if COND_LASTFM
+LASTFM_SRC=lastfm.c lastfm.h
+endif
+
+if COND_CHROMECAST
+if COND_PROTOBUF_OLD
+CHROMECAST_SRC=outputs/cast.c outputs/cast_channel.v0.pb-c.h outputs/cast_channel.v0.pb-c.c
+else
+CHROMECAST_SRC=outputs/cast.c outputs/cast_channel.pb-c.h outputs/cast_channel.pb-c.c
+endif
+endif
+
+if COND_MPD
+MPD_SRC=mpd.c mpd.h
 endif
 
 if COND_ALSA
-ALSASRC=laudio_alsa.c
-endif
-
-if COND_OSS4
-OSS4SRC=laudio_oss4.c
-endif
-
-if COND_AVIO
-AVIO_SRC=avio_evbuffer.c avio_evbuffer.h
-else
-FFURL_SRC=ffmpeg_url_evbuffer.c ffmpeg_url_evbuffer.h
+ALSA_SRC=outputs/alsa.c
 endif
 
 GPERF_FILES = \
@@ -41,61 +43,73 @@ GPERF_PRODUCTS = \
 
 ANTLR_GRAMMARS = \
 	RSP.g RSP2SQL.g \
-	DAAP.g DAAP2SQL.g
+	DAAP.g DAAP2SQL.g \
+	SMARTPL.g SMARTPL2SQL.g 
 
 ANTLR_SOURCES = \
 	RSPLexer.c RSPLexer.h RSPParser.c RSPParser.h \
 	RSP2SQL.c RSP2SQL.h \
 	DAAPLexer.c DAAPLexer.h DAAPParser.c DAAPParser.h \
-	DAAP2SQL.c DAAP2SQL.h
+	DAAP2SQL.c DAAP2SQL.h \
+	SMARTPLLexer.c SMARTPLLexer.h SMARTPLParser.c SMARTPLParser.h  \
+	SMARTPL2SQL.c SMARTPL2SQL.h
 
 ANTLR_PRODUCTS =
 
 forked_daapd_CPPFLAGS = -D_GNU_SOURCE \
 	-DDATADIR="\"$(pkgdatadir)\"" -DCONFDIR="\"$(sysconfdir)\"" \
-	-DSTATEDIR="\"$(localstatedir)\"" -DPKGLIBDIR="\"$(pkglibdir)\"" \
-	@OSS4CPPFLAGS@
+	-DSTATEDIR="\"$(localstatedir)\"" -DPKGLIBDIR="\"$(pkglibdir)\""
 
 forked_daapd_CFLAGS = \
 	@ZLIB_CFLAGS@ @AVAHI_CFLAGS@ @SQLITE3_CFLAGS@ @LIBAV_CFLAGS@ \
-	@CONFUSE_CFLAGS@ @TAGLIB_CFLAGS@ @MINIXML_CFLAGS@ @LIBPLIST_CFLAGS@ \
-	@LIBGCRYPT_CFLAGS@ @GPG_ERROR_CFLAGS@ @ALSA_CFLAGS@
+	@CONFUSE_CFLAGS@ @MINIXML_CFLAGS@ @LIBPLIST_CFLAGS@ \
+	@LIBGCRYPT_CFLAGS@ @GPG_ERROR_CFLAGS@ @ALSA_CFLAGS@ @SPOTIFY_CFLAGS@ \
+	@LIBCURL_CFLAGS@ @LIBPROTOBUF_C_CFLAGS@ @GNUTLS_CFLAGS@ @JSON_C_CFLAGS@
 
 forked_daapd_LDADD = -lrt \
 	@ZLIB_LIBS@ @AVAHI_LIBS@ @SQLITE3_LIBS@ @LIBAV_LIBS@ \
-	@CONFUSE_LIBS@ @FLAC_LIBS@ @TAGLIB_LIBS@ @LIBEVENT_LIBS@ \
-	@LIBAVL_LIBS@ @MINIXML_LIBS@ @ANTLR3C_LIBS@ @LIBPLIST_LIBS@ \
-	@LIBGCRYPT_LIBS@ @GPG_ERROR_LIBS@ @ALSA_LIBS@ @LIBUNISTRING@
+	@CONFUSE_LIBS@ @LIBEVENT_LIBS@ \
+	@MINIXML_LIBS@ @ANTLR3C_LIBS@ @LIBPLIST_LIBS@ \
+	@LIBGCRYPT_LIBS@ @GPG_ERROR_LIBS@ @ALSA_LIBS@ @LIBUNISTRING@ @SPOTIFY_LIBS@ \
+	@LIBCURL_LIBS@ @LIBPROTOBUF_C_LIBS@ @GNUTLS_LIBS@ @JSON_C_LIBS@
 
 forked_daapd_SOURCES = main.c \
 	db.c db.h \
+	db_upgrade.c db_upgrade.h \
 	logger.c logger.h \
 	conffile.c conffile.h \
+	cache.c cache.h \
 	filescanner.c filescanner.h \
-	filescanner_ffmpeg.c filescanner_urlfile.c filescanner_m3u.c $(ITUNESSRC) \
+	filescanner_ffmpeg.c filescanner_playlist.c \
+	filescanner_smartpl.c $(ITUNES_SRC) \
 	mdns_avahi.c mdns.h \
 	remote_pairing.c remote_pairing.h \
-	evhttp/http.c evhttp/evhttp.h \
-	evhttp/http-internal.h evhttp/log.h \
-	$(FFURL_SRC) $(AVIO_SRC) \
+	avio_evbuffer.c avio_evbuffer.h \
 	httpd.c httpd.h \
 	httpd_rsp.c httpd_rsp.h \
 	httpd_daap.c httpd_daap.h \
 	httpd_dacp.c httpd_dacp.h \
+	httpd_streaming.c httpd_streaming.h \
+	http.c http.h \
 	dmap_common.c dmap_common.h \
 	transcode.c transcode.h \
+	pipe.c pipe.h \
 	artwork.c artwork.h \
 	misc.c misc.h \
 	rng.c rng.h \
 	rsp_query.c rsp_query.h \
 	daap_query.c daap_query.h \
 	player.c player.h \
-	$(ALSASRC) $(OSS4SRC) laudio.h \
-	raop.c raop.h \
-	evrtsp/rtsp.c evrtp/evrtsp.h \
-	evrtsp/rtsp-internal.h evrtsp/log.h \
-	scan-wma.c \
-	$(FLACSRC) $(MUSEPACKSRC)
+	queue.c queue.h \
+	worker.c worker.h \
+	outputs.h outputs.c \
+	outputs/raop.c outputs/streaming.c outputs/dummy.c \
+	$(ALSA_SRC) $(CHROMECAST_SRC) \
+	evrtsp/rtsp.c evrtp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h \
+	$(SPOTIFY_SRC) \
+	$(LASTFM_SRC) \
+	$(MPD_SRC) \
+	listener.c listener.h
 
 nodist_forked_daapd_SOURCES = \
 	$(ANTLR_SOURCES)
@@ -104,9 +118,7 @@ BUILT_SOURCES = \
 	$(GPERF_PRODUCTS)
 
 EXTRA_DIST = \
-	$(ANTLR_GRAMMARS) \
-	scan-mpc.c \
-	scan-flac.c
+	$(ANTLR_GRAMMARS)
 
 CLEANFILES = \
 	$(GPERF_PRODUCTS)
@@ -129,7 +141,7 @@ if COND_ANTLR
 SUFFIXES = .g .u
 
 %.tokens %.c %Lexer.c %Parser.c %Lexer.h %Parser.h %.h: %.g
-	$(ANTLR) $(ANTLR_OPTIONS) $<
+	$(ANTLR) -Xconversiontimeout 30000 $(ANTLR_OPTIONS) $<
 
 %.u: %.g
 	$(ANTLR) -depend $< > $@

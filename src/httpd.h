@@ -2,9 +2,8 @@
 #ifndef __HTTPD_H__
 #define __HTTPD_H__
 
-#include <event.h>
-#include "evhttp/evhttp.h"
-
+#include <event2/http.h>
+#include <event2/buffer.h>
 
 void
 httpd_stream_file(struct evhttp_request *req, int id);

@@ -23,9 +23,6 @@
 #include <string.h>
 #include <stdint.h>
 
-#include <event.h>
-#include "evhttp/evhttp.h"
-
 #include "db.h"
 #include "misc.h"
 #include "logger.h"
@@ -46,7 +43,7 @@ dmap_get_fields_table(int *nfields)
 
 
 void
-dmap_add_container(struct evbuffer *evbuf, char *tag, int len)
+dmap_add_container(struct evbuffer *evbuf, const char *tag, int len)
 {
   unsigned char buf[4];
 
@@ -62,7 +59,7 @@ dmap_add_container(struct evbuffer *evbuf, char *tag, int len)
 }
 
 void
-dmap_add_long(struct evbuffer *evbuf, char *tag, int64_t val)
+dmap_add_long(struct evbuffer *evbuf, const char *tag, int64_t val)
 {
   unsigned char buf[12];
 
@@ -88,7 +85,7 @@ dmap_add_long(struct evbuffer *evbuf, char *tag, int64_t val)
 }
 
 void
-dmap_add_int(struct evbuffer *evbuf, char *tag, int val)
+dmap_add_int(struct evbuffer *evbuf, const char *tag, int val)
 {
   unsigned char buf[8];
 
@@ -110,7 +107,7 @@ dmap_add_int(struct evbuffer *evbuf, char *tag, int val)
 }
 
 void
-dmap_add_short(struct evbuffer *evbuf, char *tag, short val)
+dmap_add_short(struct evbuffer *evbuf, const char *tag, short val)
 {
   unsigned char buf[6];
 
@@ -130,7 +127,7 @@ dmap_add_short(struct evbuffer *evbuf, char *tag, short val)
 }
 
 void
-dmap_add_char(struct evbuffer *evbuf, char *tag, char val)
+dmap_add_char(struct evbuffer *evbuf, const char *tag, char val)
 {
   unsigned char buf[5];
 
@@ -149,7 +146,7 @@ dmap_add_char(struct evbuffer *evbuf, char *tag, char val)
 }
 
 void
-dmap_add_literal(struct evbuffer *evbuf, char *tag, char *str, int len)
+dmap_add_literal(struct evbuffer *evbuf, const char *tag, char *str, int len)
 {
   char buf[4];
 
@@ -168,7 +165,21 @@ dmap_add_literal(struct evbuffer *evbuf, char *tag, char *str, int len)
 }
 
 void
-dmap_add_string(struct evbuffer *evbuf, char *tag, const char *str)
+dmap_add_raw_uint32(struct evbuffer *evbuf, uint32_t val)
+{
+  unsigned char buf[4];
+
+  /* Value */
+  buf[0] = (val >> 24) & 0xff;
+  buf[1] = (val >> 16) & 0xff;
+  buf[2] = (val >> 8) & 0xff;
+  buf[3] = val & 0xff;
+
+  evbuffer_add(evbuf, buf, sizeof(buf));
+}
+
+void
+dmap_add_string(struct evbuffer *evbuf, const char *tag, const char *str)
 {
   unsigned char buf[4];
   int len;
@@ -330,11 +341,14 @@ dmap_add_field(struct evbuffer *evbuf, const struct dmap_field *df, char *strval
 
 
 void
-dmap_send_error(struct evhttp_request *req, char *container, char *errmsg)
+dmap_send_error(struct evhttp_request *req, const char *container, const char *errmsg)
 {
   struct evbuffer *evbuf;
   int len;
   int ret;
+
+  if (!req)
+    return;
 
   evbuf = evbuffer_new();
   if (!evbuf)
@@ -378,11 +392,13 @@ dmap_encode_file_metadata(struct evbuffer *songlist, struct evbuffer *song, stru
   int32_t val;
   int want_mikd;
   int want_asdk;
+  int want_ased;
   int i;
   int ret;
 
   want_mikd = 0;
   want_asdk = 0;
+  want_ased = 0;
 
   i = -1;
   while (1)
@@ -396,7 +412,10 @@ dmap_encode_file_metadata(struct evbuffer *songlist, struct evbuffer *song, stru
 	    break;
 
 	  df = meta[i];
-	  dfm = df->dfm;
+	  if (df->dfm)
+	    dfm = df->dfm;
+	  else
+	    break;
 	}
       /* No specific meta tags requested, send out everything */
       else
@@ -407,6 +426,13 @@ dmap_encode_file_metadata(struct evbuffer *songlist, struct evbuffer *song, stru
 
 	  df = &dmap_fields[i];
 	  dfm = dmap_fields[i].dfm;
+	}
+
+      /* Extradata not in media_file_info but flag for reply */
+      if (dfm == &dfm_dmap_ased)
+	{
+	  want_ased = 1;
+	  continue;
 	}
 
       /* Not in struct media_file_info */
@@ -427,7 +453,7 @@ dmap_encode_file_metadata(struct evbuffer *songlist, struct evbuffer *song, stru
 	  continue;
 	}
 
-      DPRINTF(E_DBG, L_DAAP, "Investigating %s\n", df->desc);
+      DPRINTF(E_SPAM, L_DAAP, "Investigating %s\n", df->desc);
 
       strval = (char **) ((char *)dbmfi + dfm->mfi_offset);
 
@@ -476,7 +502,14 @@ dmap_encode_file_metadata(struct evbuffer *songlist, struct evbuffer *song, stru
 
       dmap_add_field(song, df, *strval, val);
 
-      DPRINTF(E_DBG, L_DAAP, "Done with meta tag %s (%s)\n", df->desc, *strval);
+      DPRINTF(E_SPAM, L_DAAP, "Done with meta tag %s (%s)\n", df->desc, *strval);
+    }
+
+  /* Required for artwork in iTunes, set songartworkcount (asac) = 1 */
+  if (want_ased)
+    {
+      dmap_add_short(song, "ased", 1);
+      dmap_add_short(song, "asac", 1);
     }
 
   if (sort_tags)
@@ -496,7 +529,7 @@ dmap_encode_file_metadata(struct evbuffer *songlist, struct evbuffer *song, stru
   if (want_asdk)
     val += 9;
 
-  dmap_add_container(songlist, "mlit", EVBUFFER_LENGTH(song) + val);
+  dmap_add_container(songlist, "mlit", evbuffer_get_length(song) + val);
 
   /* Prepend mikd & asdk if needed */
   if (want_mikd)

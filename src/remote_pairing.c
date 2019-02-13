@@ -31,8 +31,6 @@
 # include <config.h>
 #endif
 
-#define NO_REMOTE_DEVICE_NAME
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -48,8 +46,9 @@
 # include <sys/eventfd.h>
 #endif
 
-#include <event.h>
-#include "evhttp/evhttp.h"
+#include <event2/event.h>
+#include <event2/buffer.h>
+#include <event2/http.h>
 
 #include <gcrypt.h>
 
@@ -86,7 +85,7 @@ static int pairing_efd;
 #else
 static int pairing_pipe[2];
 #endif
-static struct event pairingev;
+static struct event *pairingev;
 static pthread_mutex_t remote_lck = PTHREAD_MUTEX_INITIALIZER;
 static struct remote_info *remote_list;
 
@@ -364,17 +363,6 @@ add_remote_pin_data(char *devname, char *pin)
 {
   struct remote_info *ri;
 
-#ifdef NO_REMOTE_DEVICE_NAME
-  for (ri = remote_list; ri; ri = ri->next)
-  {
-    if (ri->pin)
-      free(ri->pin);
-    
-    ri->pin = pin;
-    	
-  }
-
-#else
   for (ri = remote_list; ri; ri = ri->next)
     {
       if (strcmp(ri->pi.name, devname) == 0)
@@ -394,7 +382,7 @@ add_remote_pin_data(char *devname, char *pin)
     free(ri->pin);
 
   ri->pin = pin;
-#endif
+
   return 0;
 }
 
@@ -410,21 +398,10 @@ kickoff_pairing(void)
 #else
   int dummy = 42;
   int ret;
-  int retry=0;
 
-rewrite:
   ret = write(pairing_pipe[1], &dummy, sizeof(dummy));
   if (ret != sizeof(dummy))
-  {
-  	retry++;
     DPRINTF(E_LOG, L_REMOTE, "Could not write to pairing fd: %s\n", strerror(errno));
-
-    if(retry<10)
-    {
-        sleep(1);
-        goto rewrite;
-    }
-  }
 #endif
 }
 
@@ -434,8 +411,11 @@ static void
 pairing_request_cb(struct evhttp_request *req, void *arg)
 {
   struct remote_info *ri;
+  struct evbuffer *input_buffer;
   uint8_t *response;
   char guid[17];
+  int buflen;
+  int response_code;
   int len;
   int i;
   int ret;
@@ -443,23 +423,31 @@ pairing_request_cb(struct evhttp_request *req, void *arg)
   ri = (struct remote_info *)arg;
 
   if (!req)
-    goto cleanup;
-
-  if (req->response_code != HTTP_OK)
     {
-      DPRINTF(E_LOG, L_REMOTE, "Pairing failed with Remote %s/%s, HTTP response code %d\n", ri->pi.remote_id, ri->pi.name, req->response_code);
+      DPRINTF(E_LOG, L_REMOTE, "Empty pairing request callback\n");
 
       goto cleanup;
     }
 
-  if (EVBUFFER_LENGTH(req->input_buffer) < 8)
+  response_code = evhttp_request_get_response_code(req);
+  if (response_code != HTTP_OK)
+    {
+      DPRINTF(E_LOG, L_REMOTE, "Pairing failed with Remote %s/%s, HTTP response code %d\n", ri->pi.remote_id, ri->pi.name, response_code);
+
+      goto cleanup;
+    }
+
+  input_buffer = evhttp_request_get_input_buffer(req);
+
+  buflen = evbuffer_get_length(input_buffer);
+  if (buflen < 8)
     {
       DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: pairing response too short\n", ri->pi.remote_id, ri->pi.name);
 
       goto cleanup;
     }
 
-  response = EVBUFFER_DATA(req->input_buffer);
+  response = evbuffer_pullup(input_buffer, -1);
 
   if ((response[0] != 'c') || (response[1] != 'm') || (response[2] != 'p') || (response[3] != 'a'))
     {
@@ -469,10 +457,10 @@ pairing_request_cb(struct evhttp_request *req, void *arg)
     }
 
   len = (response[4] << 24) | (response[5] << 16) | (response[6] << 8) | (response[7]);
-  if (EVBUFFER_LENGTH(req->input_buffer) < 8 + len)
+  if (buflen < 8 + len)
     {
       DPRINTF(E_LOG, L_REMOTE, "Remote %s/%s: pairing response truncated (got %d expected %d)\n",
-	      ri->pi.remote_id, ri->pi.name, (int)EVBUFFER_LENGTH(req->input_buffer), len + 8);
+	      ri->pi.remote_id, ri->pi.name, buflen, len + 8);
 
       goto cleanup;
     }
@@ -552,15 +540,13 @@ send_pairing_request(struct remote_info *ri, char *req_uri, int family)
 	return -1;
     }
 
-  evcon = evhttp_connection_new(address, port);
+  evcon = evhttp_connection_base_new(evbase_main, NULL, address, port);
   if (!evcon)
     {
       DPRINTF(E_LOG, L_REMOTE, "Could not create connection for pairing with %s\n", ri->pi.name);
 
       return -1;
     }
-
-  evhttp_connection_set_base(evcon, evbase_main);
 
   req = evhttp_request_new(pairing_request_cb, ri);
   if (!req)
@@ -577,6 +563,8 @@ send_pairing_request(struct remote_info *ri, char *req_uri, int family)
 
       goto request_fail;
     }
+
+  DPRINTF(E_DBG, L_REMOTE, "Pairing requested to %s\n", req_uri);
 
   ri->evcon = evcon;
 
@@ -694,7 +682,7 @@ pairing_cb(int fd, short event, void *arg)
       do_pairing(ri);
     }
 
-  event_add(&pairingev, NULL);
+  event_add(pairingev, NULL);
 }
 
 
@@ -772,7 +760,7 @@ touch_remote_cb(const char *name, const char *type, const char *domain, const ch
 	  return;
 	}
 
-      DPRINTF(E_DBG, L_REMOTE, "Discovered remote %s (id %s) at [%s]:%d, paircode %s\n", devname, name, address, port, paircode);
+      DPRINTF(E_LOG, L_REMOTE, "Discovered remote '%s' (id %s) at %s:%d, paircode %s\n", devname, name, address, port, paircode);
 
       /* Add the data to the list, adding the remote to the list if needed */
       pthread_mutex_lock(&remote_lck);
@@ -897,7 +885,7 @@ remote_pairing_read_pin(char *path)
       return;
     }
 
-  DPRINTF(E_DBG, L_REMOTE, "Adding Remote pin data: name '%s', pin '%s'\n", devname, pin);
+  DPRINTF(E_LOG, L_REMOTE, "Read Remote pairing data (name '%s', pin '%s') from %s\n", devname, pin, path);
 
   pthread_mutex_lock(&remote_lck);
 
@@ -929,10 +917,15 @@ remote_pairing_init(void)
       return -1;
     }
 #else
-# if defined(__linux__)
+# ifdef HAVE_PIPE2
   ret = pipe2(pairing_pipe, O_CLOEXEC | O_NONBLOCK);
 # else
-  ret = pipe(pairing_pipe);
+  if ( pipe(pairing_pipe) < 0 ||
+       fcntl(pairing_pipe[0], F_SETFL, O_CLOEXEC | O_NONBLOCK) < 0 ||
+       fcntl(pairing_pipe[1], F_SETFL, O_CLOEXEC | O_NONBLOCK) < 0 )
+    ret = -1;
+  else
+    ret = 0;
 # endif
   if (ret < 0)
     {
@@ -940,16 +933,6 @@ remote_pairing_init(void)
 
       return -1;
     }
-
-# ifndef __linux__
-  ret = fcntl(pairing_pipe[0], F_SETFL, O_NONBLOCK);
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_REMOTE, "Could not set O_NONBLOCK: %s\n", strerror(errno));
-
-      goto pairing_pipe_fail;
-    }
-# endif
 #endif /* USE_EVENTFD */
 
   ret = mdns_browse("_touch-remote._tcp", MDNS_WANT_V4, touch_remote_cb);
@@ -961,18 +944,22 @@ remote_pairing_init(void)
     }
 
 #ifdef USE_EVENTFD
-  event_set(&pairingev, pairing_efd, EV_READ, pairing_cb, NULL);
+  pairingev = event_new(evbase_main, pairing_efd, EV_READ, pairing_cb, NULL);
 #else
-  event_set(&pairingev, pairing_pipe[0], EV_READ, pairing_cb, NULL);
+  pairingev = event_new(evbase_main, pairing_pipe[0], EV_READ, pairing_cb, NULL);
 #endif
-  event_base_set(evbase_main, &pairingev);
-  event_add(&pairingev, NULL);
+  if (!pairingev)
+    {
+      DPRINTF(E_FATAL, L_REMOTE, "Out of memory for pairing event\n");
+
+      goto pairingev_fail;
+    }
+
+  event_add(pairingev, NULL);
 
   return 0;
 
-#ifndef __linux__
- pairing_pipe_fail:
-#endif
+ pairingev_fail:
  mdns_browse_fail:
 #ifdef USE_EVENTFD
   close(pairing_efd);
