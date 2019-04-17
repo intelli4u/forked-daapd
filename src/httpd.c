@@ -28,6 +28,9 @@
 #include <limits.h>
 #include <errno.h>
 #include <pthread.h>
+#ifdef HAVE_PTHREAD_NP_H
+# include <pthread_np.h>
+#endif
 #include <time.h>
 #include <sys/param.h>
 #include <sys/queue.h>
@@ -40,10 +43,12 @@
 # define USE_EVENTFD
 # include <sys/eventfd.h>
 #endif
-
+#include <event2/event.h>
+#ifdef HAVE_LIBEVENT2_OLD
+# include <event2/bufferevent.h>
+# include <event2/bufferevent_struct.h>
+#endif
 #include <zlib.h>
-#include <event.h>
-#include "evhttp/evhttp.h"
 
 #include "logger.h"
 #include "db.h"
@@ -53,8 +58,8 @@
 #include "httpd_rsp.h"
 #include "httpd_daap.h"
 #include "httpd_dacp.h"
+#include "httpd_streaming.h"
 #include "transcode.h"
-
 
 /*
  * HTTP client quirks by User-Agent, from mt-daapd
@@ -87,7 +92,7 @@ struct stream_ctx {
   struct evhttp_request *req;
   uint8_t *buf;
   struct evbuffer *evbuf;
-  struct event ev;
+  struct event *ev;
   int id;
   int fd;
   off_t size;
@@ -121,21 +126,30 @@ static int exit_efd;
 static int exit_pipe[2];
 #endif
 static int httpd_exit;
-static struct event exitev;
+static struct event *exitev;
 static struct evhttp *evhttpd;
 static pthread_t tid_httpd;
+
+#ifdef HAVE_LIBEVENT2_OLD
+struct stream_ctx *g_st;
+#endif
 
 
 static void
 stream_end(struct stream_ctx *st, int failed)
 {
-  if (st->req->evcon)
-    evhttp_connection_set_closecb(st->req->evcon, NULL, NULL);
+  struct evhttp_connection *evcon;
+
+  evcon = evhttp_request_get_connection(st->req);
+
+  if (evcon)
+    evhttp_connection_set_closecb(evcon, NULL, NULL);
 
   if (!failed)
     evhttp_send_reply_end(st->req);
 
   evbuffer_free(st->evbuf);
+  event_free(st->ev);
 
   if (st->xcode)
     transcode_cleanup(st->xcode);
@@ -144,6 +158,11 @@ stream_end(struct stream_ctx *st, int failed)
       free(st->buf);
       close(st->fd);
     }
+
+#ifdef HAVE_LIBEVENT2_OLD
+  if (g_st == st)
+    g_st = NULL;
+#endif
 
   free(st);
 }
@@ -170,7 +189,7 @@ stream_chunk_resched_cb(struct evhttp_connection *evcon, void *arg)
   st = (struct stream_ctx *)arg;
 
   evutil_timerclear(&tv);
-  ret = event_add(&st->ev, &tv);
+  ret = event_add(st->ev, &tv);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not re-add one-shot event for streaming\n");
@@ -179,6 +198,15 @@ stream_chunk_resched_cb(struct evhttp_connection *evcon, void *arg)
     }
 }
 
+#ifdef HAVE_LIBEVENT2_OLD
+static void
+stream_chunk_resched_cb_wrapper(struct bufferevent *bufev, void *arg)
+{
+  if (g_st)
+    stream_chunk_resched_cb(NULL, g_st);
+}
+#endif
+
 static void
 stream_chunk_xcode_cb(int fd, short event, void *arg)
 {
@@ -186,10 +214,11 @@ stream_chunk_xcode_cb(int fd, short event, void *arg)
   struct timeval tv;
   int xcoded;
   int ret;
+  int dummy;
 
   st = (struct stream_ctx *)arg;
 
-  xcoded = transcode(st->xcode, st->evbuf, STREAM_CHUNK_SIZE);
+  xcoded = transcode(st->evbuf, STREAM_CHUNK_SIZE, st->xcode, &dummy);
   if (xcoded <= 0)
     {
       if (xcoded == 0)
@@ -226,7 +255,17 @@ stream_chunk_xcode_cb(int fd, short event, void *arg)
   else
     ret = xcoded;
 
+#ifdef HAVE_LIBEVENT2_OLD
+  evhttp_send_reply_chunk(st->req, st->evbuf);
+
+  struct evhttp_connection *evcon = evhttp_request_get_connection(st->req);
+  struct bufferevent *bufev = evhttp_connection_get_bufferevent(evcon);
+
+  g_st = st; // Can't pass st to callback so use global - limits libevent 2.0 to a single stream
+  bufev->writecb = stream_chunk_resched_cb_wrapper;
+#else
   evhttp_send_reply_chunk_with_cb(st->req, st->evbuf, stream_chunk_resched_cb, st);
+#endif
 
   st->offset += ret;
 
@@ -236,7 +275,7 @@ stream_chunk_xcode_cb(int fd, short event, void *arg)
 
  consume: /* reschedule immediately - consume up to start_offset */
   evutil_timerclear(&tv);
-  ret = event_add(&st->ev, &tv);
+  ret = event_add(st->ev, &tv);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not re-add one-shot event for streaming (xcode)\n");
@@ -282,7 +321,17 @@ stream_chunk_raw_cb(int fd, short event, void *arg)
 
   evbuffer_add(st->evbuf, st->buf, ret);
 
+#ifdef HAVE_LIBEVENT2_OLD
+  evhttp_send_reply_chunk(st->req, st->evbuf);
+
+  struct evhttp_connection *evcon = evhttp_request_get_connection(st->req);
+  struct bufferevent *bufev = evhttp_connection_get_bufferevent(evcon);
+
+  g_st = st; // Can't pass st to callback so use global - limits libevent 2.0 to a single stream
+  bufev->writecb = stream_chunk_resched_cb_wrapper;
+#else
   evhttp_send_reply_chunk_with_cb(st->req, st->evbuf, stream_chunk_resched_cb, st);
+#endif
 
   st->offset += ret;
 
@@ -296,10 +345,10 @@ stream_fail_cb(struct evhttp_connection *evcon, void *arg)
 
   st = (struct stream_ctx *)arg;
 
-  DPRINTF(E_LOG, L_HTTPD, "Connection failed; stopping streaming of file ID %d\n", st->id);
+  DPRINTF(E_WARN, L_HTTPD, "Connection failed; stopping streaming of file ID %d\n", st->id);
 
   /* Stop streaming */
-  event_del(&st->ev);
+  event_del(st->ev);
 
   stream_end(st, 1);
 }
@@ -314,8 +363,13 @@ httpd_stream_file(struct evhttp_request *req, int id)
   void (*stream_cb)(int fd, short event, void *arg);
   struct stat sb;
   struct timeval tv;
+  struct evhttp_connection *evcon;
+  struct evkeyvalq *input_headers;
+  struct evkeyvalq *output_headers;
   const char *param;
   const char *param_end;
+  const char *ua;
+  const char *client_codecs;
   char buf[64];
   int64_t offset;
   int64_t end_offset;
@@ -325,7 +379,10 @@ httpd_stream_file(struct evhttp_request *req, int id)
 
   offset = 0;
   end_offset = 0;
-  param = evhttp_find_header(req->input_headers, "Range");
+
+  input_headers = evhttp_request_get_input_headers(req);
+
+  param = evhttp_find_header(input_headers, "Range");
   if (param)
     {
       DPRINTF(E_DBG, L_HTTPD, "Found Range header: %s\n", param);
@@ -341,7 +398,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
       else
 	{
 	  param_end = strchr(param, '-');
-	  if (param_end)
+	  if (param_end && (strlen(param_end) > 1))
 	    {
 	      ret = safe_atoi64(param_end + 1, &end_offset);
 	      if (ret < 0)
@@ -368,7 +425,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
       return;
     }
 
-  if (mfi->data_kind != 0)
+  if (mfi->data_kind != DATA_KIND_FILE)
     {
       evhttp_send_error(req, 500, "Cannot stream radio station");
 
@@ -387,7 +444,12 @@ httpd_stream_file(struct evhttp_request *req, int id)
   memset(st, 0, sizeof(struct stream_ctx));
   st->fd = -1;
 
-  transcode = transcode_needed(req->input_headers, mfi->codectype);
+  ua = evhttp_find_header(input_headers, "User-Agent");
+  client_codecs = evhttp_find_header(input_headers, "Accept-Codecs");
+
+  transcode = transcode_needed(ua, client_codecs, mfi->codectype);
+
+  output_headers = evhttp_request_get_output_headers(req);
 
   if (transcode)
     {
@@ -395,7 +457,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
 
       stream_cb = stream_chunk_xcode_cb;
 
-      st->xcode = transcode_setup(mfi, &st->size, 1);
+      st->xcode = transcode_setup(mfi, XCODE_PCM16_HEADER, &st->size);
       if (!st->xcode)
 	{
 	  DPRINTF(E_WARN, L_HTTPD, "Transcoding setup failed, aborting streaming\n");
@@ -405,8 +467,8 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	  goto out_free_st;
 	}
 
-      if (!evhttp_find_header(req->output_headers, "Content-Type"))
-	evhttp_add_header(req->output_headers, "Content-Type", "audio/wav");
+      if (!evhttp_find_header(output_headers, "Content-Type"))
+	evhttp_add_header(output_headers, "Content-Type", "audio/wav");
     }
   else
     {
@@ -470,21 +532,21 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	    DPRINTF(E_LOG, L_HTTPD, "Content-Type too large for buffer, dropping\n");
 	  else
 	    {
-	      evhttp_remove_header(req->output_headers, "Content-Type");
-	      evhttp_add_header(req->output_headers, "Content-Type", buf);
+	      evhttp_remove_header(output_headers, "Content-Type");
+	      evhttp_add_header(output_headers, "Content-Type", buf);
 	    }
 	}
       /* If no Content-Type has been set and we're streaming audio, add a proper
        * Content-Type for the file we're streaming. Remember DAAP streams audio
        * with application/x-dmap-tagged as the Content-Type (ugh!).
        */
-      else if (!evhttp_find_header(req->output_headers, "Content-Type") && mfi->type)
+      else if (!evhttp_find_header(output_headers, "Content-Type") && mfi->type)
 	{
 	  ret = snprintf(buf, sizeof(buf), "audio/%s", mfi->type);
 	  if ((ret < 0) || (ret >= sizeof(buf)))
 	    DPRINTF(E_LOG, L_HTTPD, "Content-Type too large for buffer, dropping\n");
 	  else
-	    evhttp_add_header(req->output_headers, "Content-Type", buf);
+	    evhttp_add_header(output_headers, "Content-Type", buf);
 	}
     }
 
@@ -493,7 +555,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not allocate an evbuffer for streaming\n");
 
-      evhttp_clear_headers(req->output_headers);
+      evhttp_clear_headers(output_headers);
       evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
 
       goto out_cleanup;
@@ -504,21 +566,19 @@ httpd_stream_file(struct evhttp_request *req, int id)
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not expand evbuffer for streaming\n");
 
-      evhttp_clear_headers(req->output_headers);
+      evhttp_clear_headers(output_headers);
       evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
 
       goto out_cleanup;
     }
 
+  st->ev = event_new(evbase_httpd, -1, EV_TIMEOUT, stream_cb, st);
   evutil_timerclear(&tv);
-  event_set(&st->ev, -1, EV_TIMEOUT, stream_cb, st);
-  event_base_set(evbase_httpd, &st->ev);
-  ret = event_add(&st->ev, &tv);
-  if (ret < 0)
+  if (!st->ev || (event_add(st->ev, &tv) < 0))
     {
       DPRINTF(E_LOG, L_HTTPD, "Could not add one-shot event for streaming\n");
 
-      evhttp_clear_headers(req->output_headers);
+      evhttp_clear_headers(output_headers);
       evhttp_send_error(req, HTTP_SERVUNAVAIL, "Internal Server Error");
 
       goto out_cleanup;
@@ -541,7 +601,7 @@ httpd_stream_file(struct evhttp_request *req, int id)
 	  if ((ret < 0) || (ret >= sizeof(buf)))
 	    DPRINTF(E_LOG, L_HTTPD, "Content-Length too large for buffer, dropping\n");
 	  else
-	    evhttp_add_header(req->output_headers, "Content-Length", buf);
+	    evhttp_add_header(output_headers, "Content-Length", buf);
 	}
 
       evhttp_send_reply_start(req, HTTP_OK, "OK");
@@ -560,13 +620,13 @@ httpd_stream_file(struct evhttp_request *req, int id)
       if ((ret < 0) || (ret >= sizeof(buf)))
 	DPRINTF(E_LOG, L_HTTPD, "Content-Range too large for buffer, dropping\n");
       else
-	evhttp_add_header(req->output_headers, "Content-Range", buf);
+	evhttp_add_header(output_headers, "Content-Range", buf);
 
       ret = snprintf(buf, sizeof(buf), "%" PRIi64, ((end_offset) ? end_offset + 1 : (int64_t)st->size) - offset);
       if ((ret < 0) || (ret >= sizeof(buf)))
 	DPRINTF(E_LOG, L_HTTPD, "Content-Length too large for buffer, dropping\n");
       else
-	evhttp_add_header(req->output_headers, "Content-Length", buf);
+	evhttp_add_header(output_headers, "Content-Length", buf);
 
       evhttp_send_reply_start(req, 206, "Partial Content");
     }
@@ -581,7 +641,9 @@ httpd_stream_file(struct evhttp_request *req, int id)
     }
 #endif
 
-  evhttp_connection_set_closecb(req->evcon, stream_fail_cb, st);
+  evcon = evhttp_request_get_connection(req);
+
+  evhttp_connection_set_closecb(evcon, stream_fail_cb, st);
 
   DPRINTF(E_INFO, L_HTTPD, "Kicking off streaming for %s\n", mfi->path);
 
@@ -611,19 +673,25 @@ httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struc
   unsigned char outbuf[128 * 1024];
   z_stream strm;
   struct evbuffer *gzbuf;
+  struct evkeyvalq *headers;
   const char *param;
   int flush;
   int zret;
   int ret;
 
-  if (!evbuf || (EVBUFFER_LENGTH(evbuf) == 0))
+  if (!req)
+    return;
+
+  if (!evbuf || (evbuffer_get_length(evbuf) == 0))
     {
       DPRINTF(E_DBG, L_HTTPD, "Not gzipping body-less reply\n");
 
       goto no_gzip;
     }
 
-  param = evhttp_find_header(req->input_headers, "Accept-Encoding");
+  headers = evhttp_request_get_input_headers(req);
+
+  param = evhttp_find_header(headers, "Accept-Encoding");
   if (!param)
     {
       DPRINTF(E_DBG, L_HTTPD, "Not gzipping; no Accept-Encoding header\n");
@@ -658,8 +726,8 @@ httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struc
       goto out_fail_init;
     }
 
-  strm.next_in = EVBUFFER_DATA(evbuf);
-  strm.avail_in = EVBUFFER_LENGTH(evbuf);
+  strm.next_in = evbuffer_pullup(evbuf, -1);
+  strm.avail_in = evbuffer_get_length(evbuf);
 
   flush = Z_NO_FLUSH;
 
@@ -704,13 +772,15 @@ httpd_send_reply(struct evhttp_request *req, int code, const char *reason, struc
 
   deflateEnd(&strm);
 
-  evhttp_add_header(req->output_headers, "Content-Encoding", "gzip");
+  headers = evhttp_request_get_output_headers(req);
+
+  evhttp_add_header(headers, "Content-Encoding", "gzip");
   evhttp_send_reply(req, code, reason, gzbuf);
 
   evbuffer_free(gzbuf);
 
   /* Drain original buffer, as would be after evhttp_send_reply() */
-  evbuffer_drain(evbuf, EVBUFFER_LENGTH(evbuf));
+  evbuffer_drain(evbuf, evbuffer_get_length(evbuf));
 
   return;
 
@@ -733,6 +803,7 @@ path_is_legal(char *path)
 static void
 redirect_to_index(struct evhttp_request *req, char *uri)
 {
+  struct evkeyvalq *headers;
   char buf[256];
   int slashed;
   int ret;
@@ -748,7 +819,9 @@ redirect_to_index(struct evhttp_request *req, char *uri)
       return;
     }
 
-  evhttp_add_header(req->output_headers, "Location", buf);
+  headers = evhttp_request_get_output_headers(req);
+
+  evhttp_add_header(headers, "Location", buf);
   evhttp_send_reply(req, HTTP_MOVETEMP, "Moved", NULL);
 }
 
@@ -756,12 +829,14 @@ redirect_to_index(struct evhttp_request *req, char *uri)
 static void
 serve_file(struct evhttp_request *req, char *uri)
 {
+  const char *host;
   char *ext;
   char path[PATH_MAX];
   char *deref;
   char *ctype;
   char *passwd;
   struct evbuffer *evbuf;
+  struct evkeyvalq *headers;
   struct stat sb;
   int fd;
   int i;
@@ -781,8 +856,9 @@ serve_file(struct evhttp_request *req, char *uri)
     }
   else
     {
-      if ((strcmp(req->remote_host, "::1") != 0)
-	  && (strcmp(req->remote_host, "127.0.0.1") != 0))
+      host = evhttp_request_get_host(req);
+      if ((strcmp(host, "::1") != 0)
+	  && (strcmp(host, "127.0.0.1") != 0))
 	{
 	  DPRINTF(E_LOG, L_HTTPD, "Remote web interface request denied; no password set\n");
 
@@ -912,8 +988,9 @@ serve_file(struct evhttp_request *req, char *uri)
 	}
     }
 
-  evhttp_add_header(req->output_headers, "Content-Type", ctype);
+  headers = evhttp_request_get_output_headers(req);
 
+  evhttp_add_header(headers, "Content-Type", ctype);
   evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
 
   evbuffer_free(evbuf);
@@ -927,7 +1004,7 @@ httpd_gen_cb(struct evhttp_request *req, void *arg)
   char *uri;
   char *ptr;
 
-  req_uri = evhttp_request_uri(req);
+  req_uri = evhttp_request_get_uri(req);
   if (!req_uri)
     {
       redirect_to_index(req, "/");
@@ -939,7 +1016,7 @@ httpd_gen_cb(struct evhttp_request *req, void *arg)
   ptr = strchr(uri, '?');
   if (ptr)
     {
-      DPRINTF(E_DBG, L_HTTPD, "Found query string\n");
+      DPRINTF(E_SPAM, L_HTTPD, "Found query string\n");
 
       *ptr = '\0';
     }
@@ -964,6 +1041,12 @@ httpd_gen_cb(struct evhttp_request *req, void *arg)
   else if (dacp_is_request(req, uri))
     {
       dacp_request(req);
+
+      goto out;
+    }
+  else if (streaming_is_request(req, uri))
+    {
+      streaming_request(req);
 
       goto out;
     }
@@ -1013,6 +1096,7 @@ exit_cb(int fd, short event, void *arg)
 char *
 httpd_fixup_uri(struct evhttp_request *req)
 {
+  struct evkeyvalq *headers;
   const char *ua;
   const char *uri;
   const char *u;
@@ -1021,7 +1105,7 @@ httpd_fixup_uri(struct evhttp_request *req)
   char *f;
   int len;
 
-  uri = evhttp_request_uri(req);
+  uri = evhttp_request_get_uri(req);
   if (!uri)
     return NULL;
 
@@ -1030,7 +1114,8 @@ httpd_fixup_uri(struct evhttp_request *req)
   if (!q)
     return strdup(uri);
 
-  ua = evhttp_find_header(req->input_headers, "User-Agent");
+  headers = evhttp_request_get_input_headers(req);
+  ua = evhttp_find_header(headers, "User-Agent");
   if (!ua)
     return strdup(uri);
 
@@ -1095,6 +1180,7 @@ int
 httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *realm)
 {
   struct evbuffer *evbuf;
+  struct evkeyvalq *headers;
   char *header;
   const char *auth;
   char *authuser;
@@ -1102,7 +1188,8 @@ httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *rea
   int len;
   int ret;
 
-  auth = evhttp_find_header(req->input_headers, "Authorization");
+  headers = evhttp_request_get_input_headers(req);
+  auth = evhttp_find_header(headers, "Authorization");
   if (!auth)
     {
       DPRINTF(E_DBG, L_HTTPD, "No Authorization header\n");
@@ -1185,7 +1272,8 @@ httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *rea
       return -1;
     }
 
-  evhttp_add_header(req->output_headers, "WWW-Authenticate", header);
+  headers = evhttp_request_get_output_headers(req);
+  evhttp_add_header(headers, "WWW-Authenticate", header);
   evbuffer_add(evbuf, http_reply_401, strlen(http_reply_401));
   evhttp_send_reply(req, 401, "Unauthorized", evbuf);
 
@@ -1199,13 +1287,11 @@ httpd_basic_auth(struct evhttp_request *req, char *user, char *passwd, char *rea
 int
 httpd_init(void)
 {
-  unsigned short port;
   int v6enabled;
+  unsigned short port;
   int ret;
 
   httpd_exit = 0;
-
-  v6enabled = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6");
 
   evbase_httpd = event_base_new();
   if (!evbase_httpd)
@@ -1239,6 +1325,8 @@ httpd_init(void)
       goto dacp_fail;
     }
 
+  streaming_init();
+
 #ifdef USE_EVENTFD
   exit_efd = eventfd(0, EFD_CLOEXEC);
   if (exit_efd < 0)
@@ -1247,8 +1335,10 @@ httpd_init(void)
 
       goto pipe_fail;
     }
+
+  exitev = event_new(evbase_httpd, exit_efd, EV_READ, exit_cb, NULL);
 #else
-# if defined(__linux__)
+# ifdef HAVE_PIPE2
   ret = pipe2(exit_pipe, O_CLOEXEC);
 # else
   ret = pipe(exit_pipe);
@@ -1259,43 +1349,46 @@ httpd_init(void)
 
       goto pipe_fail;
     }
-#endif /* USE_EVENTFD */
 
-#ifdef USE_EVENTFD
-  event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
-#else
-  event_set(&exitev, exit_pipe[0], EV_READ, exit_cb, NULL);
-#endif
-  event_base_set(evbase_httpd, &exitev);
-  event_add(&exitev, NULL);
+  exitev = event_new(evbase_httpd, exit_pipe[0], EV_READ, exit_cb, NULL);
+#endif /* USE_EVENTFD */
+  if (!exitev)
+    {
+      DPRINTF(E_FATAL, L_HTTPD, "Could not create exit event\n");
+
+      goto event_fail;
+    }
+  event_add(exitev, NULL);
 
   evhttpd = evhttp_new(evbase_httpd);
   if (!evhttpd)
     {
       DPRINTF(E_FATAL, L_HTTPD, "Could not create HTTP server\n");
 
-      goto evhttp_fail;
+      goto event_fail;
     }
 
+  v6enabled = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6");
   port = cfg_getint(cfg_getsec(cfg, "library"), "port");
-
-  /* We are binding v6 and v4 separately, and we allow v6 to fail
-   * as IPv6 might not be supported on the system.
-   * We still warn about the failure, in case there's another issue.
-   */
-  ret = evhttp_bind_socket(evhttpd, "0.0.0.0", port);
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_HTTPD, "Could not bind INADDR_ANY:%d\n", port);
-
-      goto bind_fail;
-    }
 
   if (v6enabled)
     {
       ret = evhttp_bind_socket(evhttpd, "::", port);
       if (ret < 0)
-	DPRINTF(E_WARN, L_HTTPD, "Could not bind IN6ADDR_ANY:%d (that's OK)\n", port);
+	{
+	  DPRINTF(E_LOG, L_HTTPD, "Could not bind to port %d with IPv6, falling back to IPv4\n", port);
+	  v6enabled = 0;
+	}
+    }
+
+  if (!v6enabled)
+    {
+      ret = evhttp_bind_socket(evhttpd, "0.0.0.0", port);
+      if (ret < 0)
+	{
+	  DPRINTF(E_FATAL, L_HTTPD, "Could not bind to port %d (forked-daapd already running?)\n", port);
+	  goto bind_fail;
+	}
     }
 
   evhttp_set_gencb(evhttpd, httpd_gen_cb, NULL);
@@ -1308,12 +1401,18 @@ httpd_init(void)
       goto thread_fail;
     }
 
+#if defined(HAVE_PTHREAD_SETNAME_NP)
+  pthread_setname_np(tid_httpd, "httpd");
+#elif defined(HAVE_PTHREAD_SET_NAME_NP)
+  pthread_set_name_np(tid_httpd, "httpd");
+#endif
+
   return 0;
 
  thread_fail:
  bind_fail:
   evhttp_free(evhttpd);
- evhttp_fail:
+ event_fail:
 #ifdef USE_EVENTFD
   close(exit_efd);
 #else
@@ -1321,6 +1420,7 @@ httpd_init(void)
   close(exit_pipe[1]);
 #endif
  pipe_fail:
+  streaming_deinit();
   dacp_deinit();
  dacp_fail:
   daap_deinit();
@@ -1366,6 +1466,7 @@ httpd_deinit(void)
       return;
     }
 
+  streaming_deinit();
   rsp_deinit();
   dacp_deinit();
   daap_deinit();

@@ -22,22 +22,34 @@ enum sort_type {
   S_ALBUM,
   S_ARTIST,
   S_PLAYLIST,
+  S_YEAR,
+  S_GENRE,
+  S_COMPOSER,
+  S_DISC,
+  S_TRACK,
+  S_VPATH,
 };
 
 #define Q_F_BROWSE (1 << 15)
 
 enum query_type {
-  Q_ITEMS            = (1 << 0),
-  Q_PL               = (1 << 1),
-  Q_PLITEMS          = (1 << 2),
-  Q_BROWSE_ARTISTS   = Q_F_BROWSE | (1 << 3),
-  Q_BROWSE_ALBUMS    = Q_F_BROWSE | (1 << 4),
-  Q_BROWSE_GENRES    = Q_F_BROWSE | (1 << 5),
-  Q_BROWSE_COMPOSERS = Q_F_BROWSE | (1 << 6),
-  Q_GROUP_ALBUMS     = (1 << 7),
-  Q_GROUP_ARTISTS    = (1 << 8),
-  Q_GROUP_ITEMS      = (1 << 9),
-  Q_GROUP_DIRS       = Q_F_BROWSE | (1 << 10),
+  Q_ITEMS            = 1,
+  Q_PL               = 2,
+  Q_PLITEMS          = 3,
+  Q_BROWSE_ARTISTS   = Q_F_BROWSE | 4,
+  Q_BROWSE_ALBUMS    = Q_F_BROWSE | 5,
+  Q_BROWSE_GENRES    = Q_F_BROWSE | 6,
+  Q_BROWSE_COMPOSERS = Q_F_BROWSE | 7,
+  Q_GROUP_ALBUMS     = 8,
+  Q_GROUP_ARTISTS    = 9,
+  Q_GROUP_ITEMS      = 10,
+  Q_GROUP_DIRS       = Q_F_BROWSE | 11,
+  Q_BROWSE_YEARS     = Q_F_BROWSE | 12,
+  Q_COUNT_ITEMS      = 13,
+  Q_BROWSE_DISCS     = Q_F_BROWSE | 14,
+  Q_BROWSE_TRACKS    = Q_F_BROWSE | 15,
+  Q_BROWSE_VPATH     = Q_F_BROWSE | 16,
+  Q_BROWSE_PATH      = Q_F_BROWSE | 17,
 };
 
 #define ARTWORK_UNKNOWN   0
@@ -47,6 +59,7 @@ enum query_type {
 #define ARTWORK_DIR       4
 #define ARTWORK_PARENTDIR 5
 #define ARTWORK_SPOTIFY   6
+#define ARTWORK_HTTP      7
 
 struct query_params {
   /* Query parameters, filled in by caller */
@@ -65,7 +78,8 @@ struct query_params {
 
   /* Private query context, keep out */
   sqlite3_stmt *stmt;
-  char buf[32];
+  char buf1[32];
+  char buf2[32];
 };
 
 struct pairing_info {
@@ -74,6 +88,23 @@ struct pairing_info {
   char *guid;
 };
 
+enum media_kind {
+  MEDIA_KIND_MUSIC = 1,
+  MEDIA_KIND_MOVIE = 2,
+  MEDIA_KIND_PODCAST = 4,
+  MEDIA_KIND_AUDIOBOOK = 8,
+  MEDIA_KIND_MUSICVIDEO = 32,
+  MEDIA_KIND_TVSHOW = 64,
+};
+
+enum data_kind {
+  DATA_KIND_FILE = 0,    /* normal file */
+  DATA_KIND_HTTP = 1,    /* network stream (radio) */
+  DATA_KIND_SPOTIFY = 2, /* iTunes has no spotify data kind, but we use 2 */
+  DATA_KIND_PIPE = 3,    /* iTunes has no pipe data kind, but we use 3 */
+};
+
+/* Note that fields marked as integers in the metadata map in filescanner_ffmpeg must be uint32_t here */
 struct media_file_info {
   char *path;
   uint32_t index;
@@ -121,8 +152,8 @@ struct media_file_info {
 
   uint32_t item_kind;    /* song or movie */
   uint32_t data_kind;    /* dmap.datakind (asdk) */
-  uint64_t sample_count;
-  char compilation;
+  uint64_t sample_count; //TODO [unused] sample count is never set and therefor always 0
+  uint32_t compilation;
   char artwork;
 
   /* iTunes 5+ */
@@ -149,14 +180,22 @@ struct media_file_info {
   char *album_sort;
   char *composer_sort;
   char *album_artist_sort;
+
+  char *virtual_path;
+
+  uint32_t directory_id; /* Id of directory */
+  uint32_t date_released;
 };
 
 #define mfi_offsetof(field) offsetof(struct media_file_info, field)
 
+/* PL_SPECIAL value must be in sync with type value in Q_PL* in db.c */
 enum pl_type {
-  PL_PLAIN,
-  PL_SMART,
-  PL_MAX
+  PL_SPECIAL = 0,
+  PL_FOLDER = 1,
+  PL_SMART = 2,
+  PL_PLAIN = 3,
+  PL_MAX,
 };
 
 struct playlist_info {
@@ -164,12 +203,16 @@ struct playlist_info {
   char *title;           /* playlist name as displayed in iTunes (minm) */
   enum pl_type type;     /* see PL_ types */
   uint32_t items;        /* number of items (mimc) */
+  uint32_t streams;      /* number of internet streams */
   char *query;           /* where clause if type 1 (MSPS) */
   uint32_t db_timestamp; /* time last updated */
   uint32_t disabled;
   char *path;            /* path of underlying playlist */
   uint32_t index;        /* index of playlist for paths with multiple playlists */
   uint32_t special_id;   /* iTunes identifies certain 'special' playlists with special meaning */
+  char *virtual_path;    /* virtual path of underlying playlist */
+  uint32_t parent_id;    /* Id of parent playlist if the playlist is nested */
+  uint32_t directory_id; /* Id of directory */
 };
 
 #define pli_offsetof(field) offsetof(struct playlist_info, field)
@@ -179,12 +222,16 @@ struct db_playlist_info {
   char *title;
   char *type;
   char *items;
+  char *streams;
   char *query;
   char *db_timestamp;
   char *disabled;
   char *path;
   char *index;
   char *special_id;
+  char *virtual_path;
+  char *parent_id;
+  char *directory_id;
 };
 
 #define dbpli_offsetof(field) offsetof(struct db_playlist_info, field)
@@ -273,6 +320,9 @@ struct db_media_file_info {
   char *album_sort;
   char *composer_sort;
   char *album_artist_sort;
+  char *virtual_path;
+  char *directory_id;
+  char *date_released;
 };
 
 #define dbmfi_offsetof(field) offsetof(struct db_media_file_info, field)
@@ -293,6 +343,33 @@ struct watch_enum {
   sqlite3_stmt *stmt;
 };
 
+struct filecount_info {
+  uint32_t count;
+  uint32_t length;
+};
+
+/* Directory ids must be in sync with the ids in Q_DIR* in db.c */
+enum directory_ids {
+  DIR_ROOT = 1,
+  DIR_FILE = 2,
+  DIR_HTTP = 3,
+  DIR_SPOTIFY = 4,
+};
+
+struct directory_info {
+  uint32_t id;
+  char *virtual_path;
+  uint32_t db_timestamp;
+  uint32_t disabled;
+  uint32_t parent_id;
+};
+
+struct directory_enum {
+  int parent_id;
+
+  /* Private enum context, keep out */
+  sqlite3_stmt *stmt;
+};
 
 char *
 db_escape_string(const char *str);
@@ -308,6 +385,9 @@ unicode_fixup_mfi(struct media_file_info *mfi);
 
 void
 free_pli(struct playlist_info *pli, int content_only);
+
+void
+free_di(struct directory_info *di, int content_only);
 
 /* Maintenance and DB hygiene */
 void
@@ -337,10 +417,13 @@ int
 db_query_fetch_file(struct query_params *qp, struct db_media_file_info *dbmfi);
 
 int
-db_query_fetch_pl(struct query_params *qp, struct db_playlist_info *dbpli);
+db_query_fetch_pl(struct query_params *qp, struct db_playlist_info *dbpli, int with_itemcount);
 
 int
 db_query_fetch_group(struct query_params *qp, struct db_group_info *dbgri);
+
+int
+db_query_fetch_count(struct query_params *qp, struct filecount_info *fci);
 
 int
 db_query_fetch_string(struct query_params *qp, char **string);
@@ -351,6 +434,12 @@ db_query_fetch_string_sort(struct query_params *qp, char **string, char **sortst
 /* Files */
 int
 db_files_get_count(void);
+
+int
+db_files_get_artist_count(void);
+
+int
+db_files_get_album_count(void);
 
 int
 db_files_get_count_bymatch(char *path);
@@ -388,17 +477,29 @@ db_file_id_byfile(char *filename);
 int
 db_file_id_byurl(char *url);
 
+int
+db_file_id_by_virtualpath_match(char *path);
+
 void
 db_file_stamp_bypath(char *path, time_t *stamp, int *id);
 
 struct media_file_info *
 db_file_fetch_byid(int id);
 
+struct media_file_info *
+db_file_fetch_byvirtualpath(char *path);
+
 int
 db_file_add(struct media_file_info *mfi);
 
 int
 db_file_update(struct media_file_info *mfi);
+
+void
+db_file_update_icy(int id, char *artist, char *album);
+
+void
+db_file_save_seek(int id, uint32_t seek);
 
 void
 db_file_delete_bypath(char *path);
@@ -411,6 +512,9 @@ db_file_disable_bymatch(char *path, char *strip, uint32_t cookie);
 
 int
 db_file_enable_bycookie(uint32_t cookie, char *path);
+
+int
+db_file_update_directoryid(char *path, int dir_id);
 
 /* Playlists */
 int
@@ -426,10 +530,13 @@ struct playlist_info *
 db_pl_fetch_bypath(char *path);
 
 struct playlist_info *
+db_pl_fetch_byvirtualpath(char *virtual_path);
+
+struct playlist_info *
 db_pl_fetch_bytitlepath(char *title, char *path);
 
 int
-db_pl_add(char *title, char *path, int *id);
+db_pl_add(struct playlist_info *pli, int *id);
 
 int
 db_pl_add_item_bypath(int plid, char *path);
@@ -441,7 +548,7 @@ void
 db_pl_clear_items(int id);
 
 int
-db_pl_update(char *title, char *path, int id);
+db_pl_update(struct playlist_info *pli);
 
 void
 db_pl_delete(int id);
@@ -465,6 +572,35 @@ db_groups_clear(void);
 int
 db_group_persistentid_byid(int id, int64_t *persistentid);
 
+
+/* Directories */
+int
+db_directory_id_byvirtualpath(char *virtual_path);
+
+int
+db_directory_enum_start(struct directory_enum *de);
+
+int
+db_directory_enum_fetch(struct directory_enum *de, struct directory_info *di);
+
+void
+db_directory_enum_end(struct directory_enum *de);
+
+int
+db_directory_addorupdate(char *virtual_path, int disabled, int parent_id);
+
+void
+db_directory_ping_bymatch(char *path);
+
+void
+db_directory_disable_bymatch(char *path, char *strip, uint32_t cookie);
+
+int
+db_directory_enable_bycookie(uint32_t cookie, char *path);
+
+int
+db_directory_enable_bypath(char *path);
+
 /* Remotes */
 int
 db_pairing_add(struct pairing_info *pi);
@@ -479,6 +615,9 @@ db_spotify_purge(void);
 
 void
 db_spotify_pl_delete(int id);
+
+void
+db_spotify_files_delete();
 #endif
 
 /* Admin */
@@ -496,7 +635,7 @@ db_admin_delete(const char *key);
 
 /* Speakers */
 int
-db_speaker_save(uint64_t id, int selected, int volume);
+db_speaker_save(uint64_t id, int selected, int volume, const char *name);
 
 int
 db_speaker_get(uint64_t id, int *selected, int *volume);

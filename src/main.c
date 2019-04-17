@@ -47,9 +47,10 @@
 #include <pthread.h>
 
 #include <getopt.h>
-#include <event.h>
-#include <libavcodec/avcodec.h>
-//#include <libavformat/avformat.h>
+#include <event2/event.h>
+#include <libavutil/log.h>
+#include <libavformat/avformat.h>
+#include <libavfilter/avfilter.h>
 
 #include <gcrypt.h>
 GCRY_THREAD_OPTION_PTHREAD_IMPL;
@@ -58,28 +59,34 @@ GCRY_THREAD_OPTION_PTHREAD_IMPL;
 #include "db.h"
 #include "logger.h"
 #include "misc.h"
+#include "cache.h"
 #include "filescanner.h"
 #include "httpd.h"
+#include "mpd.h"
 #include "mdns.h"
 #include "remote_pairing.h"
 #include "player.h"
-#if LIBAVFORMAT_VERSION_MAJOR < 53
-# include "ffmpeg_url_evbuffer.h"
-#endif
+#include "worker.h"
 
+#ifdef LASTFM
+# include <curl/curl.h>
+#endif
+#ifdef HAVE_SPOTIFY_H
+# include "spotify.h"
+#endif
 
 #define PIDFILE   STATEDIR "/run/" PACKAGE ".pid"
 
 struct event_base *evbase_main;
 
-static struct event sig_event;
+static struct event *sig_event;
 static int main_exit;
 
 static void
 version(void)
 {
   fprintf(stdout, "Forked Media Server: Version %s\n", VERSION);
-  fprintf(stdout, "Copyright (C) 2009-2011 Julien BLACHE <jb@jblache.org>\n");
+  fprintf(stdout, "Copyright (C) 2009-2015 Julien BLACHE <jb@jblache.org>\n");
   fprintf(stdout, "Based on mt-daapd, Copyright (C) 2003-2007 Ron Pedde <ron@pedde.com>\n");
   fprintf(stdout, "Released under the GNU General Public License version 2 or later\n");
 }
@@ -214,14 +221,16 @@ daemonize(int background, char *pidfile)
 }
 
 static int
-register_services(char *ffid, int no_rsp, int no_daap)
+register_services(char *ffid, int no_rsp, int no_daap, int mdns_no_mpd)
 {
   cfg_t *lib;
+  cfg_t *mpd;
   char *libname;
   char *password;
   char *txtrecord[10];
   char records[9][128];
   int port;
+  int mpd_port;
   uint32_t hash;
   int i;
   int ret;
@@ -261,11 +270,11 @@ register_services(char *ffid, int no_rsp, int no_daap)
 
   port = cfg_getint(lib, "port");
 
-  /* Register web server service */
-  ret = mdns_register(libname, "_http._tcp", port, txtrecord);
+  /* Register web server service - disabled since we have no web interface */
+/*  ret = mdns_register(libname, "_http._tcp", port, txtrecord);
   if (ret < 0)
     return ret;
-
+*/
   /* Register RSP service */
   if (!no_rsp)
     {
@@ -311,6 +320,16 @@ register_services(char *ffid, int no_rsp, int no_daap)
   if (ret < 0)
     return ret;
 
+  /* Register MPD serivce */
+  mpd = cfg_getsec(cfg, "mpd");
+  mpd_port = cfg_getint(mpd, "port");
+  if (!mdns_no_mpd && mpd_port > 0)
+    {
+      ret = mdns_register(libname, "_mpd._tcp", mpd_port, NULL);
+            if (ret < 0)
+      	return ret;
+    }
+
   return 0;
 }
 
@@ -352,7 +371,7 @@ signal_signalfd_cb(int fd, short event, void *arg)
   if (main_exit)
     event_base_loopbreak(evbase_main);
   else
-    event_add(&sig_event, NULL);
+    event_add(sig_event, NULL);
 }
 
 #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
@@ -397,7 +416,7 @@ signal_kqueue_cb(int fd, short event, void *arg)
   if (main_exit)
     event_base_loopbreak(evbase_main);
   else
-    event_add(&sig_event, NULL);
+    event_add(sig_event, NULL);
 }
 #endif
 
@@ -439,6 +458,7 @@ main(int argc, char **argv)
   int background;
   int mdns_no_rsp;
   int mdns_no_daap;
+  int mdns_no_mpd;
   int loglevel;
   char *logdomains;
   char *logfile;
@@ -447,7 +467,6 @@ main(int argc, char **argv)
   const char *gcry_version;
   sigset_t sigs;
   int sigfd;
-  int fp;
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
   struct kevent ke_sigs[4];
 #endif
@@ -478,7 +497,8 @@ main(int argc, char **argv)
   ffid = NULL;
   mdns_no_rsp = 0;
   mdns_no_daap = 0;
- 
+  mdns_no_mpd = 1; // only announce if mpd protocol support is activated
+
   while ((option = getopt_long(argc, argv, "D:d:c:P:fb:v", option_map, NULL)) != -1)
     {
       switch (option)
@@ -570,9 +590,6 @@ main(int argc, char **argv)
 
   DPRINTF(E_LOG, L_MAIN, "Forked Media Server Version %s taking off\n", VERSION);
 
-  /* Initialize ffmpeg */
-//  avcodec_init();
-
   ret = av_lockmgr_register(ffmpeg_lockmgr);
   if (ret < 0)
     {
@@ -581,10 +598,17 @@ main(int argc, char **argv)
       ret = EXIT_FAILURE;
       goto ffmpeg_init_fail;
     }
+
   av_register_all();
+  avfilter_register_all();
+#if LIBAVFORMAT_VERSION_MAJOR >= 54 || (LIBAVFORMAT_VERSION_MAJOR == 53 && LIBAVFORMAT_VERSION_MINOR >= 13)
+  avformat_network_init();
+#endif
   av_log_set_callback(logger_ffmpeg);
-#if LIBAVFORMAT_VERSION_MAJOR < 53
-  register_ffmpeg_evbuffer_url_protocol();
+
+#ifdef LASTFM
+  /* Initialize libcurl */
+  curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
 
   /* Initialize libgcrypt */
@@ -625,7 +649,6 @@ main(int argc, char **argv)
     }
 
   /* Daemonize and drop privileges */
-#if 0
   ret = daemonize(background, pidfile);
   if (ret < 0)
     {
@@ -634,20 +657,9 @@ main(int argc, char **argv)
       ret = EXIT_FAILURE;
       goto daemon_fail;
     }
-#else
-      fp = fopen(pidfile, "w");
-      if (!fp)
-     	{
-	        DPRINTF(E_LOG, L_MAIN, "Error opening pidfile (%s): %s\n", pidfile, strerror(errno));
-	        return -1;
-	    }
 
-      fprintf(fp, "%d\n", getpid());
-      fclose(fp);
-
-#endif
-  /* Initialize libevent (after forking) */
-  evbase_main = event_init();
+  /* Initialize event base (after forking) */
+  evbase_main = event_base_new();
 
   DPRINTF(E_LOG, L_MAIN, "mDNS init\n");
   ret = mdns_init();
@@ -680,6 +692,26 @@ main(int argc, char **argv)
       goto db_fail;
     }
 
+  /* Spawn worker thread */
+  ret = worker_init();
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Worker thread failed to start\n");
+
+      ret = EXIT_FAILURE;
+      goto worker_fail;
+    }
+
+  /* Spawn cache thread */
+  ret = cache_init();
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Cache thread failed to start\n");
+
+      ret = EXIT_FAILURE;
+      goto cache_fail;
+    }
+
   /* Spawn file scanner thread */
   ret = filescanner_init();
   if (ret != 0)
@@ -689,6 +721,15 @@ main(int argc, char **argv)
       ret = EXIT_FAILURE;
       goto filescanner_fail;
     }
+
+#ifdef HAVE_SPOTIFY_H
+  /* Spawn Spotify thread */
+  ret = spotify_init();
+  if (ret < 0)
+    {
+      DPRINTF(E_INFO, L_MAIN, "Spotify thread not started\n");;
+    }
+#endif
 
   /* Spawn player thread */
   ret = player_init();
@@ -710,6 +751,19 @@ main(int argc, char **argv)
       goto httpd_fail;
     }
 
+#ifdef MPD
+  /* Spawn MPD thread */
+  ret = mpd_init();
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "MPD thread failed to start\n");
+
+      ret = EXIT_FAILURE;
+      goto mpd_fail;
+    }
+  mdns_no_mpd = 0;
+#endif
+
   /* Start Remote pairing service */
   ret = remote_pairing_init();
   if (ret != 0)
@@ -721,7 +775,7 @@ main(int argc, char **argv)
     }
 
   /* Register mDNS services */
-  ret = register_services(ffid, mdns_no_rsp, mdns_no_daap);
+  ret = register_services(ffid, mdns_no_rsp, mdns_no_daap, mdns_no_mpd);
   if (ret < 0)
     {
       ret = EXIT_FAILURE;
@@ -739,8 +793,7 @@ main(int argc, char **argv)
       goto signalfd_fail;
     }
 
-  event_set(&sig_event, sigfd, EV_READ, signal_signalfd_cb, NULL);
-
+  sig_event = event_new(evbase_main, sigfd, EV_READ, signal_signalfd_cb, NULL);
 #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
   sigfd = kqueue();
   if (sigfd < 0)
@@ -765,11 +818,17 @@ main(int argc, char **argv)
       goto signalfd_fail;
     }
 
-  event_set(&sig_event, sigfd, EV_READ, signal_kqueue_cb, NULL);
+  sig_event = event_new(evbase_main, sigfd, EV_READ, signal_kqueue_cb, NULL);
 #endif
+  if (!sig_event)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "Could not create signal event\n");
 
-  event_base_set(evbase_main, &sig_event);
-  event_add(&sig_event, NULL);
+      ret = EXIT_FAILURE;
+      goto sig_event_fail;
+    }
+
+  event_add(sig_event, NULL);
 
   /* Run the loop */
   event_base_dispatch(evbase_main);
@@ -784,12 +843,19 @@ main(int argc, char **argv)
   DPRINTF(E_LOG, L_MAIN, "mDNS deinit\n");
   mdns_deinit();
 
+ sig_event_fail:
  signalfd_fail:
  mdns_reg_fail:
   DPRINTF(E_LOG, L_MAIN, "Remote pairing deinit\n");
   remote_pairing_deinit();
 
  remote_fail:
+#ifdef MPD
+  DPRINTF(E_LOG, L_MAIN, "MPD deinit\n");
+  mpd_deinit();
+
+ mpd_fail:
+#endif
   DPRINTF(E_LOG, L_MAIN, "HTTPd deinit\n");
   httpd_deinit();
 
@@ -798,13 +864,26 @@ main(int argc, char **argv)
   player_deinit();
 
  player_fail:
+#ifdef HAVE_SPOTIFY_H
+  DPRINTF(E_LOG, L_MAIN, "Spotify deinit\n");
+  spotify_deinit();
+#endif
   DPRINTF(E_LOG, L_MAIN, "File scanner deinit\n");
   filescanner_deinit();
 
  filescanner_fail:
+  DPRINTF(E_LOG, L_MAIN, "Cache deinit\n");
+  cache_deinit();
+
+ cache_fail:
+  DPRINTF(E_LOG, L_MAIN, "Worker deinit\n");
+  worker_deinit();
+
+ worker_fail:
   DPRINTF(E_LOG, L_MAIN, "Database deinit\n");
   db_perthread_deinit();
   db_deinit();
+
  db_fail:
   if (ret == EXIT_FAILURE)
     {
@@ -829,6 +908,12 @@ main(int argc, char **argv)
 
  signal_block_fail:
  gcrypt_init_fail:
+#ifdef LASTFM
+  curl_global_cleanup();
+#endif
+#if LIBAVFORMAT_VERSION_MAJOR >= 54 || (LIBAVFORMAT_VERSION_MAJOR == 53 && LIBAVFORMAT_VERSION_MINOR >= 13)
+  avformat_network_deinit();
+#endif
   av_lockmgr_register(NULL);
 
  ffmpeg_init_fail:

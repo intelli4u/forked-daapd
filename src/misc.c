@@ -28,6 +28,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
 #include <limits.h>
@@ -262,11 +263,32 @@ safe_hextou64(const char *str, uint64_t *val)
 
 
 /* Key/value functions */
+struct keyval *
+keyval_alloc(void)
+{
+  struct keyval *kv;
+
+  kv = (struct keyval *)malloc(sizeof(struct keyval));
+  if (!kv)
+    {
+      DPRINTF(E_LOG, L_MISC, "Out of memory for keyval alloc\n");
+
+      return NULL;
+    }
+
+  memset(kv, 0, sizeof(struct keyval));
+
+  return kv;
+}
+
 int
 keyval_add_size(struct keyval *kv, const char *name, const char *value, size_t size)
 {
   struct onekeyval *okv;
   const char *val;
+
+  if (!kv)
+    return -1;
 
   /* Check for duplicate key names */
   val = keyval_get(kv, name);
@@ -334,6 +356,9 @@ keyval_remove(struct keyval *kv, const char *name)
   struct onekeyval *okv;
   struct onekeyval *pokv;
 
+  if (!kv)
+    return;
+
   for (pokv = NULL, okv = kv->head; okv; pokv = okv, okv = okv->next)
     {
       if (strcasecmp(okv->name, name) == 0)
@@ -362,6 +387,9 @@ keyval_get(struct keyval *kv, const char *name)
 {
   struct onekeyval *okv;
 
+  if (!kv)
+    return NULL;
+
   for (okv = kv->head; okv; okv = okv->next)
     {
       if (strcasecmp(okv->name, name) == 0)
@@ -377,6 +405,9 @@ keyval_clear(struct keyval *kv)
   struct onekeyval *hokv;
   struct onekeyval *okv;
 
+  if (!kv)
+    return;
+
   hokv = kv->head;
 
   for (okv = hokv; hokv; okv = hokv)
@@ -390,6 +421,47 @@ keyval_clear(struct keyval *kv)
 
   kv->head = NULL;
   kv->tail = NULL;
+}
+
+void
+keyval_sort(struct keyval *kv)
+{
+  struct onekeyval *head;
+  struct onekeyval *okv;
+  struct onekeyval *sokv;
+
+  if (!kv)
+    return;
+
+  head = kv->head;
+  for (okv = kv->head; okv; okv = okv->next)
+    {
+      okv->sort = NULL;
+      for (sokv = kv->head; sokv; sokv = sokv->next)
+	{
+	  // We try to find a name which is greater than okv->name
+	  // but less than our current candidate (okv->sort->name)
+	  if ( (strcmp(sokv->name, okv->name) > 0) &&
+	       ((okv->sort == NULL) || (strcmp(sokv->name, okv->sort->name) < 0)) )
+	    okv->sort = sokv;
+	}
+
+      // Find smallest name, which will be the new head
+      if (strcmp(okv->name, head->name) < 0)
+	head = okv;
+    }
+
+  while ((okv = kv->head))
+    {
+      kv->head  = okv->next;
+      okv->next = okv->sort;
+    }
+
+  kv->head = head;
+  for (okv = kv->head; okv; okv = okv->next)
+    kv->tail = okv;
+
+  DPRINTF(E_DBG, L_MISC, "Keyval sorted. New head: %s. New tail: %s.\n", kv->head->name, kv->tail->name);
 }
 
 
@@ -414,8 +486,9 @@ m_realpath(const char *pathname)
   return ret;
 }
 
+
 char *
-unicode_fixup_string(char *str)
+unicode_fixup_string(char *str, const char *fromcode)
 {
   uint8_t *ret;
   size_t len;
@@ -438,7 +511,7 @@ unicode_fixup_string(char *str)
       return str;
     }
 
-  ret = u8_conv_from_encoding("ascii", iconveh_question_mark, str, len, NULL, NULL, &len);
+  ret = u8_strconv_from_encoding(str, fromcode, iconveh_question_mark);
   if (!ret)
     {
       DPRINTF(E_LOG, L_MISC, "Could not convert string '%s' to UTF-8: %s\n", str, strerror(errno));
@@ -449,10 +522,47 @@ unicode_fixup_string(char *str)
   return (char *)ret;
 }
 
-uint32_t
-djb_hash(void *data, size_t len)
+char *
+trimwhitespace(const char *str)
 {
-  unsigned char *bytes = data;
+  char *ptr;
+  char *start;
+  char *out;
+
+  if (!str)
+    return NULL;
+
+  // Find the beginning
+  while (isspace(*str))
+    str++;
+
+  if (*str == 0) // All spaces?
+    return strdup("");
+
+  // Make copy, because we will need to insert a null terminator
+  start = strdup(str);
+  if (!start)
+    return NULL;
+
+  // Find the end
+  ptr = start + strlen(start) - 1;
+  while (ptr > start && isspace(*ptr))
+    ptr--;
+
+  // Insert null terminator
+  *(ptr+1) = 0;
+
+  out = strdup(start);
+
+  free(start);
+
+  return out;
+}
+
+uint32_t
+djb_hash(const void *data, size_t len)
+{
+  const unsigned char *bytes = data;
   uint32_t hash = 5381;
 
   while (len--)
@@ -754,7 +864,57 @@ murmur_hash64(const void *key, int len, uint32_t seed)
 
   return h;
 }
-
 #else
 # error Platform not supported
 #endif
+
+int
+clock_gettime_with_res(clockid_t clock_id, struct timespec *tp, struct timespec *res)
+{
+  int ret;
+
+  if ((!tp) || (!res))
+    return -1;
+
+  ret = clock_gettime(clock_id, tp);
+  /* this will only work for sub-second resolutions. */
+  if (ret == 0 && res->tv_nsec > 1)
+    tp->tv_nsec = (tp->tv_nsec/res->tv_nsec)*res->tv_nsec;
+
+  return ret;
+}
+
+struct timespec
+timespec_add(struct timespec time1, struct timespec time2)
+{
+  struct timespec result;
+
+  result.tv_sec = time1.tv_sec + time2.tv_sec;
+  result.tv_nsec = time1.tv_nsec + time2.tv_nsec;
+  if (result.tv_nsec >= 1000000000L)
+    {
+      result.tv_sec++;
+      result.tv_nsec -= 1000000000L;
+    }
+  return result;
+}
+
+int
+timespec_cmp(struct timespec time1, struct timespec time2)
+{
+  /* Less than. */
+  if (time1.tv_sec < time2.tv_sec)
+    return -1;
+  /* Greater than. */
+  else if (time1.tv_sec > time2.tv_sec)
+    return 1;
+  /* Less than. */
+  else if (time1.tv_nsec < time2.tv_nsec)
+    return -1;
+  /* Greater than. */
+  else if (time1.tv_nsec > time2.tv_nsec)
+    return 1;
+  /* Equal. */
+  else
+    return 0;
+}

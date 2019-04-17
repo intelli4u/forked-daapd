@@ -244,7 +244,6 @@ sqlext_daap_unicode_xcollation(void *notused, int llen, const void *left, int rl
   return rpp;
 }
 
-
 int
 sqlite3_extension_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi)
 {

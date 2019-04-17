@@ -37,8 +37,9 @@
 # include <sys/eventfd.h>
 #endif
 
-#include <event.h>
-#include "evhttp/evhttp.h"
+#include <event2/event.h>
+#include <event2/buffer.h>
+#include <event2/keyvalq_struct.h>
 
 #include "logger.h"
 #include "misc.h"
@@ -48,8 +49,10 @@
 #include "httpd_dacp.h"
 #include "dmap_common.h"
 #include "db.h"
+#include "daap_query.h"
 #include "player.h"
-
+#include "queue.h"
+#include "listener.h"
 
 /* httpd event base, from httpd.c */
 extern struct event_base *evbase_httpd;
@@ -103,18 +106,22 @@ dacp_propget_nowplaying(struct evbuffer *evbuf, struct player_status *status, st
 static void
 dacp_propget_playingtime(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
 
-static void 
-dacp_propget_fullscreenenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
-static void 
-dacp_propget_fullscreen(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
-static void 
-dacp_propget_visualizerenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
-static void 
-dacp_propget_visualizer(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
-static void 
-dacp_propget_itms_songid(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
-static void 
-dacp_propget_haschapterdata(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi); 
+static void
+dacp_propget_fullscreenenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_fullscreen(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_visualizerenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_visualizer(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_itms_songid(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_haschapterdata(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_mediakind(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
+static void
+dacp_propget_extendedmediakind(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi);
 
 /* Forward - properties setters */
 static void
@@ -139,88 +146,65 @@ static int update_efd;
 #else
 static int update_pipe[2];
 #endif
-static struct event updateev;
+static struct event *updateev;
 static int current_rev;
 
 /* Play status update requests */
 static struct dacp_update_request *update_requests;
 
 /* Seek timer */
-static struct event seek_timer;
+static struct event *seek_timer;
 static int seek_target;
 
-static void 
-dacp_propget_fullscreenenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
-{ 
-  // TODO 
-} 
-
-static void 
-dacp_propget_fullscreen(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
-{ 
-  // TODO 
-} 
-
-static void 
-dacp_propget_visualizerenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
-{ 
-  // TODO 
-} 
-
-static void 
-dacp_propget_visualizer(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
-{ 
-  // TODO 
-} 
- 
-static void 
-dacp_propget_itms_songid(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
-{ 
-  // TODO 
-} 
- 
-static void 
-dacp_propget_haschapterdata(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi) 
-{ 
-  // TODO 
-} 
+/* If an item is removed from the library while in the queue, we replace it with this */
+static struct media_file_info dummy_mfi =
+{
+  .id = 9999999,
+  .title = "(unknown title)",
+  .artist = "(unknown artist)",
+  .album = "(unknown album)",
+  .genre = "(unknown genre)",
+};
 
 
 /* DACP helpers */
 static void
 dacp_nowplaying(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
 {
-  char canp[16];
+  uint32_t id;
+  int64_t songalbumid;
 
   if ((status->status == PLAY_STOPPED) || !mfi)
     return;
 
-  memset(canp, 0, sizeof(canp));
+  /* Send bogus id's if playing internet radio, because clients like
+   * Remote and Retune will only update metadata (like artwork) if the id's
+   * change (which they wouldn't do if we sent the real ones)
+   * FIXME: Giving the client invalid ids on purpose is hardly ideal, but the
+   * clients don't seem to use these ids for anything other than rating.
+   */
+  if (mfi->data_kind == DATA_KIND_HTTP)
+    {
+      id = djb_hash(mfi->album, strlen(mfi->album));
+      songalbumid = (int64_t)id;
+    }
+  else
+    {
+      id = status->id;
+      songalbumid = mfi->songalbumid;
+    }
 
-  canp[3] = 1; /* 0-3 database ID */
-
-  canp[4]  = (status->plid >> 24) & 0xff;
-  canp[5]  = (status->plid >> 16) & 0xff;
-  canp[6]  = (status->plid >> 8) & 0xff;
-  canp[7]  = status->plid & 0xff;
-
-  canp[8]  = (status->pos_pl >> 24) & 0xff; /* 8-11 position in playlist */
-  canp[9]  = (status->pos_pl >> 16) & 0xff;
-  canp[10] = (status->pos_pl >> 8) & 0xff;
-  canp[11] = status->pos_pl & 0xff;
-
-  canp[12] = (status->id >> 24) & 0xff; /* 12-15 track ID */
-  canp[13] = (status->id >> 16) & 0xff;
-  canp[14] = (status->id >> 8) & 0xff;
-  canp[15] = status->id & 0xff;
-
-  dmap_add_literal(evbuf, "canp", canp, sizeof(canp));
+  dmap_add_container(evbuf, "canp", 16);
+  dmap_add_raw_uint32(evbuf, 1); /* Database */
+  dmap_add_raw_uint32(evbuf, status->plid);
+  dmap_add_raw_uint32(evbuf, status->pos_pl);
+  dmap_add_raw_uint32(evbuf, id);
 
   dmap_add_string(evbuf, "cann", mfi->title);
   dmap_add_string(evbuf, "cana", mfi->artist);
   dmap_add_string(evbuf, "canl", mfi->album);
   dmap_add_string(evbuf, "cang", mfi->genre);
-  dmap_add_long(evbuf, "asai", mfi->songalbumid);
+  dmap_add_long(evbuf, "asai", songalbumid);
 
   dmap_add_int(evbuf, "cmmk", 1);
 }
@@ -231,7 +215,11 @@ dacp_playingtime(struct evbuffer *evbuf, struct player_status *status, struct me
   if ((status->status == PLAY_STOPPED) || !mfi)
     return;
 
-  dmap_add_int(evbuf, "cant", mfi->song_length - status->pos_ms); /* Remaining time in ms */
+  if (mfi->song_length)
+    dmap_add_int(evbuf, "cant", mfi->song_length - status->pos_ms); /* Remaining time in ms */
+  else
+    dmap_add_int(evbuf, "cant", 0); /* Unknown remaining time */
+
   dmap_add_int(evbuf, "cast", mfi->song_length); /* Song length in ms */
 }
 
@@ -262,7 +250,7 @@ make_playstatusupdate(struct evbuffer *evbuf)
 	{
 	  DPRINTF(E_LOG, L_DACP, "Could not fetch file id %d\n", status.id);
 
-	  return -1;
+	  mfi = &dummy_mfi;
 	}
     }
   else
@@ -272,23 +260,36 @@ make_playstatusupdate(struct evbuffer *evbuf)
 
   dmap_add_int(psu, "cmsr", current_rev); /* 12 */
 
-  dmap_add_char(psu, "cavc", 1);              /* 9 */ /* volume controllable */
-  dmap_add_char(psu, "caps", status.status);  /* 9 */ /* play status, 2 = stopped, 3 = paused, 4 = playing */
-  dmap_add_char(psu, "cash", status.shuffle); /* 9 */ /* shuffle, true/false */
-  dmap_add_char(psu, "carp", status.repeat);  /* 9 */ /* repeat, 0 = off, 1 = repeat song, 2 = repeat (playlist) */
-
-  dmap_add_int(psu, "caas", 2);           /* 12 */ /* available shuffle states */
-  dmap_add_int(psu, "caar", 6);           /* 12 */ /* available repeat states */
+  dmap_add_char(psu, "caps", status.status);  /*  9 */ /* play status, 2 = stopped, 3 = paused, 4 = playing */
+  dmap_add_char(psu, "cash", status.shuffle); /*  9 */ /* shuffle, true/false */
+  dmap_add_char(psu, "carp", status.repeat);  /*  9 */ /* repeat, 0 = off, 1 = repeat song, 2 = repeat (playlist) */
+  dmap_add_char(psu, "cafs", 0);              /*  9 */ /* dacp.fullscreen */
+  dmap_add_char(psu, "cavs", 0);              /*  9 */ /* dacp.visualizer */
+  dmap_add_char(psu, "cavc", 1);              /*  9 */ /* volume controllable */
+  dmap_add_int(psu, "caas", 2);               /* 12 */ /* available shuffle states */
+  dmap_add_int(psu, "caar", 6);               /* 12 */ /* available repeat states */
+  dmap_add_char(psu, "cafe", 0);              /*  9 */ /* dacp.fullscreenenabled */
+  dmap_add_char(psu, "cave", 0);              /*  9 */ /* dacp.visualizerenabled */
 
   if (mfi)
     {
       dacp_nowplaying(psu, &status, mfi);
+
+      dmap_add_int(psu, "casa", 1);           /* 12 */ /* unknown */
+      dmap_add_int(psu, "astm", mfi->song_length);
+      dmap_add_char(psu, "casc", 1);         /* Maybe an indication of extra data? */
+      dmap_add_char(psu, "caks", 6);         /* Unknown */
+
       dacp_playingtime(psu, &status, mfi);
 
-      free_mfi(mfi, 0);
+      if (mfi != &dummy_mfi)
+	free_mfi(mfi, 0);
     }
 
-  dmap_add_container(evbuf, "cmst", EVBUFFER_LENGTH(psu));    /* 8 + len */
+  dmap_add_char(psu, "casu", 1);              /*  9 */ /* unknown */
+  dmap_add_char(psu, "ceQu", 0);              /*  9 */ /* unknown */
+
+  dmap_add_container(evbuf, "cmst", evbuffer_get_length(psu));    /* 8 + len */
 
   ret = evbuffer_add_buffer(evbuf, psu);
   evbuffer_free(psu);
@@ -308,6 +309,9 @@ playstatusupdate_cb(int fd, short what, void *arg)
   struct dacp_update_request *ur;
   struct evbuffer *evbuf;
   struct evbuffer *update;
+  struct evhttp_connection *evcon;
+  uint8_t *buf;
+  size_t len;
   int ret;
 
 #ifdef USE_EVENTFD
@@ -349,15 +353,25 @@ playstatusupdate_cb(int fd, short what, void *arg)
   if (ret < 0)
     goto out_free_update;
 
+  len = evbuffer_get_length(update);
+
   for (ur = update_requests; update_requests; ur = update_requests)
     {
       update_requests = ur->next;
 
-      evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
+      evcon = evhttp_request_get_connection(ur->req);
+      if (evcon)
+	evhttp_connection_set_closecb(evcon, NULL, NULL);
 
-      evbuffer_add(evbuf, EVBUFFER_DATA(update), EVBUFFER_LENGTH(update));
-
-      httpd_send_reply(ur->req, HTTP_OK, "OK", evbuf);
+      // Only copy buffer if we actually need to reuse it
+      if (ur->next)
+	{
+	  buf = evbuffer_pullup(update, -1);
+	  evbuffer_add(evbuf, buf, len);
+	  httpd_send_reply(ur->req, HTTP_OK, "OK", evbuf);
+	}
+      else
+	httpd_send_reply(ur->req, HTTP_OK, "OK", update);
 
       free(ur);
     }
@@ -369,16 +383,20 @@ playstatusupdate_cb(int fd, short what, void *arg)
  out_free_evbuf:
   evbuffer_free(evbuf);
  readd:
-  ret = event_add(&updateev, NULL);
+  ret = event_add(updateev, NULL);
   if (ret < 0)
     DPRINTF(E_LOG, L_DACP, "Couldn't re-add event for playstatusupdate\n");
 }
 
 /* Thread: player */
 static void
-dacp_playstatus_update_handler(void)
+dacp_playstatus_update_handler(enum listener_event_type type)
 {
   int ret;
+
+  // Only send status update on player change events
+  if (type != LISTENER_PLAYER)
+    return;
 
 #ifdef USE_EVENTFD
   ret = eventfd_write(update_efd, 1);
@@ -398,13 +416,15 @@ update_fail_cb(struct evhttp_connection *evcon, void *arg)
 {
   struct dacp_update_request *ur;
   struct dacp_update_request *p;
+  struct evhttp_connection *evc;
 
   ur = (struct dacp_update_request *)arg;
 
   DPRINTF(E_DBG, L_DACP, "Update request: client closed connection\n");
 
-  if (ur->req->evcon)
-    evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
+  evc = evhttp_request_get_connection(ur->req);
+  if (evc)
+    evhttp_connection_set_closecb(evc, NULL, NULL);
 
   if (ur == update_requests)
     update_requests = ur->next;
@@ -479,6 +499,54 @@ static void
 dacp_propget_playingtime(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
 {
   dacp_playingtime(evbuf, status, mfi);
+}
+
+static void
+dacp_propget_fullscreenenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_fullscreen(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_visualizerenabled(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_visualizer(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_itms_songid(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_haschapterdata(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_mediakind(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
+}
+
+static void
+dacp_propget_extendedmediakind(struct evbuffer *evbuf, struct player_status *status, struct media_file_info *mfi)
+{
+	// TODO
 }
 
 /* Properties setters */
@@ -557,9 +625,6 @@ dacp_propset_playingtime(const char *value, struct evkeyvalq *query)
   struct timeval tv;
   int ret;
 
-  if (event_initialized(&seek_timer))
-    event_del(&seek_timer);
-
   ret = safe_atoi32(value, &seek_target);
   if (ret < 0)
     {
@@ -568,11 +633,9 @@ dacp_propset_playingtime(const char *value, struct evkeyvalq *query)
       return;
     }
 
-  evtimer_set(&seek_timer, seek_timer_cb, NULL);
-  event_base_set(evbase_httpd, &seek_timer);
   evutil_timerclear(&tv);
   tv.tv_usec = 200 * 1000;
-  evtimer_add(&seek_timer, &tv);
+  evtimer_add(seek_timer, &tv);
 }
 
 static void
@@ -655,11 +718,21 @@ dacp_propset_userrating(const char *value, struct evkeyvalq *query)
     }
 
   mfi = db_file_fetch_byid(itemid);
+
+  /* If no mfi, it may be because we sent an invalid nowplaying itemid. In this
+   * case request the real one from the player and default to that.
+   */
   if (!mfi)
     {
-      DPRINTF(E_LOG, L_DACP, "Could not fetch file id %d\n", itemid);
+      DPRINTF(E_WARN, L_DACP, "Invalid id %d for rating, defaulting to player id\n", itemid);
 
-      return;
+      ret = player_now_playing(&itemid);
+      if ((ret < 0) || !(mfi = db_file_fetch_byid(itemid)))
+	{
+	  DPRINTF(E_WARN, L_DACP, "Could not find an id for rating\n");
+
+	  return;
+	}
     }
 
   mfi->rating = rating;
@@ -676,41 +749,251 @@ dacp_propset_userrating(const char *value, struct evkeyvalq *query)
 static void
 dacp_reply_ctrlint(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
 {
-  dmap_add_container(evbuf, "caci", 127); /* 8 + len */
-  dmap_add_int(evbuf, "mstt", 200);       /* 12 */
-  dmap_add_char(evbuf, "muty", 0);        /* 9 */
-  dmap_add_int(evbuf, "mtco", 1);         /* 12 */
-  dmap_add_int(evbuf, "mrco", 1);         /* 12 */
-  dmap_add_container(evbuf, "mlcl", 125); /* 8 + len */
-  dmap_add_container(evbuf, "mlit", 117); /* 8 + len */
-  dmap_add_int(evbuf, "miid", 1);         /* 12 */ /* Database ID */
-  dmap_add_char(evbuf, "cmik", 1);        /* 9 */
+  /* /ctrl-int */
+  /* If tags are added or removed container sizes should be adjusted too */
+  dmap_add_container(evbuf, "caci", 194); /*  8, unknown dacp container - size of content */
+  dmap_add_int(evbuf, "mstt", 200);       /* 12, dmap.status */
+  dmap_add_char(evbuf, "muty", 0);        /*  9, dmap.updatetype */
+  dmap_add_int(evbuf, "mtco", 1);         /* 12, dmap.specifiedtotalcount */
+  dmap_add_int(evbuf, "mrco", 1);         /* 12, dmap.returnedcount */
+  dmap_add_container(evbuf, "mlcl", 141); /*  8, dmap.listing - size of content */
+  dmap_add_container(evbuf, "mlit", 133); /*  8, dmap.listingitem - size of content */
+  dmap_add_int(evbuf, "miid", 1);         /* 12, dmap.itemid - database ID */
+  dmap_add_char(evbuf, "cmik", 1);        /*  9, unknown */
 
-  dmap_add_int(evbuf, "cmpr", (2 << 16 | 1)); /* 12 */
-  dmap_add_int(evbuf, "capr", (2 << 16 | 2)); /* 12 */
+  dmap_add_int(evbuf, "cmpr", (2 << 16 | 2)); /* 12, dmcp.protocolversion */
+  dmap_add_int(evbuf, "capr", (2 << 16 | 5)); /* 12, dacp.protocolversion */
 
-  dmap_add_char(evbuf, "cmsp", 1);        /* 9 */
-  dmap_add_char(evbuf, "aeFR", 0x64);     /* 9 */
-  dmap_add_char(evbuf, "cmsv", 1);        /* 9 */
-  dmap_add_char(evbuf, "cass", 1);        /* 9 */
-  dmap_add_char(evbuf, "caov", 1);        /* 9 */
-  dmap_add_char(evbuf, "casu", 1);        /* 9 */
-  dmap_add_char(evbuf, "ceSG", 1);        /* 9 */
-  dmap_add_char(evbuf, "cmrl", 1);        /* 9 */
+  dmap_add_char(evbuf, "cmsp", 1);        /*  9, unknown */
+  dmap_add_char(evbuf, "aeFR", 0x64);     /*  9, unknown */
+  dmap_add_char(evbuf, "cmsv", 1);        /*  9, unknown */
+  dmap_add_char(evbuf, "cass", 1);        /*  9, unknown */
+  dmap_add_char(evbuf, "caov", 1);        /*  9, unknown */
+  dmap_add_char(evbuf, "casu", 1);        /*  9, unknown */
+  dmap_add_char(evbuf, "ceSG", 1);        /*  9, unknown */
+  dmap_add_char(evbuf, "cmrl", 1);        /*  9, unknown */
+  dmap_add_long(evbuf, "ceSX", (1 << 1 | 1));  /* 16, unknown dacp - lowest bit announces support for playqueue-contents/-edit */
 
   httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+}
+
+static int
+find_first_song_id(const char *query)
+{
+  struct db_media_file_info dbmfi;
+  struct query_params qp;
+  int id;
+  int ret;
+
+  memset(&qp, 0, sizeof(struct query_params));
+
+  /* We only want the id of the first song */
+  qp.type = Q_ITEMS;
+  qp.idx_type = I_FIRST;
+  qp.sort = S_NONE;
+  qp.offset = 0;
+  qp.limit = 1;
+  qp.filter = daap_query_parse_sql(query);
+  if (!qp.filter)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Improper DAAP query!\n");
+
+      return -1;
+    }
+
+  ret = db_query_start(&qp);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not start query\n");
+
+      goto no_query_start;
+    }
+
+  if (((ret = db_query_fetch_file(&qp, &dbmfi)) == 0) && (dbmfi.id))
+    {
+      ret = safe_atoi32(dbmfi.id, &id);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_PLAYER, "Invalid song id in query result!\n");
+
+	  goto no_result;
+	}
+
+      DPRINTF(E_DBG, L_PLAYER, "Found index song (id %d)\n", id);
+      ret = 1;
+    }
+  else
+    {
+      DPRINTF(E_LOG, L_PLAYER, "No song matches query (results %d): %s\n", qp.results, qp.filter);
+
+      goto no_result;
+    }
+
+ no_result:
+  db_query_end(&qp);
+
+ no_query_start:
+  if (qp.filter)
+    free(qp.filter);
+
+  if (ret == 1)
+    return id;
+  else
+    return -1;
+}
+
+
+static int
+dacp_queueitem_make(struct queue_item **head, const char *query, const char *queuefilter, const char *sort, int quirk)
+{
+  struct media_file_info *mfi;
+  struct query_params qp;
+  struct queue_item *items;
+  int64_t albumid;
+  int64_t artistid;
+  int plid;
+  int id;
+  int idx;
+  int ret;
+  int len;
+  char *s;
+  char buf[1024];
+
+  if (query)
+    {
+      id = find_first_song_id(query);
+      if (id < 0)
+        return -1;
+    }
+  else
+    id = 0;
+
+  memset(&qp, 0, sizeof(struct query_params));
+
+  qp.offset = 0;
+  qp.limit = 0;
+  qp.sort = S_NONE;
+  qp.idx_type = I_NONE;
+
+  if (quirk)
+    {
+      qp.sort = S_ALBUM;
+      qp.type = Q_ITEMS;
+      mfi = db_file_fetch_byid(id);
+      if (!mfi)
+	return -1;
+      snprintf(buf, sizeof(buf), "f.songalbumid = %" PRIi64, mfi->songalbumid);
+      free_mfi(mfi, 0);
+      qp.filter = strdup(buf);
+    }
+  else if (queuefilter)
+    {
+      len = strlen(queuefilter);
+      if ((len > 6) && (strncmp(queuefilter, "album:", 6) == 0))
+	{
+	  qp.type = Q_ITEMS;
+	  ret = safe_atoi64(strchr(queuefilter, ':') + 1, &albumid);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_PLAYER, "Invalid album id in queuefilter: %s\n", queuefilter);
+
+	      return -1;
+	    }
+	  snprintf(buf, sizeof(buf), "f.songalbumid = %" PRIi64, albumid);
+	  qp.filter = strdup(buf);
+	}
+      else if ((len > 7) && (strncmp(queuefilter, "artist:", 7) == 0))
+	{
+	  qp.type = Q_ITEMS;
+	  ret = safe_atoi64(strchr(queuefilter, ':') + 1, &artistid);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_PLAYER, "Invalid artist id in queuefilter: %s\n", queuefilter);
+
+	      return -1;
+	    }
+	  snprintf(buf, sizeof(buf), "f.songartistid = %" PRIi64, artistid);
+	  qp.filter = strdup(buf);
+	}
+      else if ((len > 9) && (strncmp(queuefilter, "playlist:", 9) == 0))
+	{
+	  qp.type = Q_PLITEMS;
+	  ret = safe_atoi32(strchr(queuefilter, ':') + 1, &plid);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_PLAYER, "Invalid playlist id in queuefilter: %s\n", queuefilter);
+
+	      return -1;
+	    }
+	  qp.id = plid;
+	  qp.filter = strdup("1 = 1");
+	}
+      else if ((len > 6) && (strncmp(queuefilter, "genre:", 6) == 0))
+	{
+	  qp.type = Q_ITEMS;
+	  s = db_escape_string(queuefilter + 6);
+	  if (!s)
+	    return -1;
+	  snprintf(buf, sizeof(buf), "f.genre = '%s'", s);
+	  qp.filter = strdup(buf);
+	}
+      else
+	{
+	  DPRINTF(E_LOG, L_PLAYER, "Unknown queuefilter %s\n", queuefilter);
+
+	  // If the queuefilter is unkown, ignore it and use the query parameter instead to build the sql query
+	  id = 0;
+	  qp.type = Q_ITEMS;
+	  qp.filter = daap_query_parse_sql(query);
+	}
+    }
+  else
+    {
+      id = 0;
+      qp.type = Q_ITEMS;
+      qp.filter = daap_query_parse_sql(query);
+    }
+
+  if (sort)
+    {
+      if (strcmp(sort, "name") == 0)
+	qp.sort = S_NAME;
+      else if (strcmp(sort, "album") == 0)
+	qp.sort = S_ALBUM;
+      else if (strcmp(sort, "artist") == 0)
+	qp.sort = S_ARTIST;
+    }
+
+  items = queueitem_make_byquery(&qp);
+
+  if (qp.filter)
+    free(qp.filter);
+
+  if (items)
+    *head = items;
+  else
+    return -1;
+
+  // Get the position (0-based) of the first item
+  idx = queueitem_pos(items, id);
+
+  return idx;
 }
 
 static void
 dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
 {
   struct player_status status;
-  struct player_source *ps;
+  struct queue_item *items;
   const char *sort;
   const char *cuequery;
   const char *param;
   uint32_t id;
+  uint32_t item_id;
+  uint32_t pos;
   int clear;
+  struct player_history *history;
+  int hist;
   int ret;
 
   /* /cue?command=play&query=...&sort=...&index=N */
@@ -734,8 +1017,8 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     {
       sort = evhttp_find_header(query, "sort");
 
-      ps = player_queue_make_daap(cuequery, sort);
-      if (!ps)
+      ret = dacp_queueitem_make(&items, cuequery, NULL, sort, 0);
+      if (ret < 0)
 	{
 	  DPRINTF(E_LOG, L_DACP, "Could not build song queue\n");
 
@@ -743,7 +1026,7 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 	  return;
 	}
 
-      player_queue_add(ps);
+      player_queue_add(items, NULL);
     }
   else
     {
@@ -758,15 +1041,56 @@ dacp_reply_cue_play(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     dacp_propset_shufflestate(param, NULL);
 
   id = 0;
+  item_id = 0;
+  pos = 0;
   param = evhttp_find_header(query, "index");
   if (param)
     {
-      ret = safe_atou32(param, &id);
+      ret = safe_atou32(param, &pos);
       if (ret < 0)
 	DPRINTF(E_LOG, L_DACP, "Invalid index (%s) in cue request\n", param);
     }
 
-  ret = player_playback_start(&id);
+  /* If selection was from Up Next queue or history queue (command will be playnow), then index is relative */
+  hist = 0;
+  if ((param = evhttp_find_header(query, "command")) && (strcmp(param, "playnow") == 0))
+    {
+      /* If mode parameter is -1 or 1, the index is relative to the history queue, otherwise to the Up Next queue */
+      param = evhttp_find_header(query, "mode");
+      if (param && ((strcmp(param, "-1") == 0) || (strcmp(param, "1") == 0)))
+	{
+	  /* Play from history queue */
+	  hist = 1;
+	  history = player_history_get();
+	  if (history->count > pos)
+	    {
+	      pos = (history->start_index + history->count - pos - 1) % MAX_HISTORY_COUNT;
+	      item_id = history->item_id[pos];
+	    }
+	  else
+	    {
+	      DPRINTF(E_LOG, L_DACP, "Could not start playback from history\n");
+
+	      dmap_send_error(req, "cacr", "Playback failed to start");
+	      return;
+	    }
+	}
+      else
+	{
+	  /* Play from Up Next queue */
+	  pos += status.pos_pl;
+
+	  if (status.status == PLAY_STOPPED && pos > 0)
+	    pos--;
+	}
+    }
+
+  /* If playing from history queue, the pos holds the id of the item to play */
+  if (hist)
+    ret = player_playback_start_byitemid(item_id, &id);
+  else
+    ret = player_playback_start_bypos(pos, &id);
+
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DACP, "Could not start playback\n");
@@ -834,16 +1158,19 @@ static void
 dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
 {
   struct player_status status;
-  struct player_source *ps;
+  struct queue_item *items;
   struct daap_session *s;
   const char *param;
   const char *shuffle;
   uint32_t plid;
   uint32_t id;
+  int pos;
   int ret;
 
   /* /ctrl-int/1/playspec?database-spec='dmap.persistentid:0x1'&container-spec='dmap.persistentid:0x5'&container-item-spec='dmap.containeritemid:0x9'
-   * With our DAAP implementation, container-spec is the playlist ID and container-item-spec is the song ID
+   * or (Apple Remote when playing a Podcast)
+   * /ctrl-int/1/playspec?database-spec='dmap.persistentid:0x1'&container-spec='dmap.persistentid:0x5'&item-spec='dmap.itemid:0x9'
+   * With our DAAP implementation, container-spec is the playlist ID and container-item-spec/item-spec is the song ID
    */
 
   s = daap_session_find(req, query, evbuf);
@@ -882,10 +1209,11 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
   if (!shuffle)
     {
       /* Start song ID */
-      param = evhttp_find_header(query, "container-item-spec");
-      if (!param)
+      if ((param = evhttp_find_header(query, "item-spec")))
+	plid = 0; // This is a podcast/audiobook - just play a single item, not a playlist
+      else if (!(param = evhttp_find_header(query, "container-item-spec")))
 	{
-	  DPRINTF(E_LOG, L_DACP, "No container-item-spec in playspec request\n");
+	  DPRINTF(E_LOG, L_DACP, "No container-item-spec/item-spec in playspec request\n");
 
 	  goto out_fail;
 	}
@@ -893,7 +1221,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
       param = strchr(param, ':');
       if (!param)
 	{
-	  DPRINTF(E_LOG, L_DACP, "Malformed container-item-spec parameter in playspec request\n");
+	  DPRINTF(E_LOG, L_DACP, "Malformed container-item-spec/item-spec parameter in playspec request\n");
 
 	  goto out_fail;
 	}
@@ -902,7 +1230,7 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
       ret = safe_hextou32(param, &id);
       if (ret < 0)
 	{
-	  DPRINTF(E_LOG, L_DACP, "Couldn't convert container-item-spec to an integer in playspec (%s)\n", param);
+	  DPRINTF(E_LOG, L_DACP, "Couldn't convert container-item-spec/item-spec to an integer in playspec (%s)\n", param);
 
 	  goto out_fail;
 	}
@@ -912,15 +1240,26 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 
   DPRINTF(E_DBG, L_DACP, "Playspec request for playlist %d, start song id %d%s\n", plid, id, (shuffle) ? ", shuffle" : "");
 
-  ps = player_queue_make_pl(plid, &id);
-  if (!ps)
+  items = NULL;
+  if (plid > 0)
+    items = queueitem_make_byplid(plid);
+  else if (id > 0)
+    items = queueitem_make_byid(id);
+
+  if (!items)
     {
       DPRINTF(E_LOG, L_DACP, "Could not build song queue from playlist %d\n", plid);
 
       goto out_fail;
     }
 
-  DPRINTF(E_DBG, L_DACP, "Playspec start song index is %d\n", id);
+  pos = queueitem_pos(items, id);
+  if (pos < 0)
+    {
+      DPRINTF(E_DBG, L_DACP, "No item with %d found in queue\n", id);
+      pos = 0;
+    }
+  DPRINTF(E_DBG, L_DACP, "Playspec start song index is %d\n", pos);
 
   player_get_status(&status);
 
@@ -928,13 +1267,13 @@ dacp_reply_playspec(struct evhttp_request *req, struct evbuffer *evbuf, char **u
     player_playback_stop();
 
   player_queue_clear();
-  player_queue_add(ps);
+  player_queue_add(items, NULL);
   player_queue_plid(plid);
 
   if (shuffle)
     dacp_propset_shufflestate(shuffle, NULL);
 
-  ret = player_playback_start(&id);
+  ret = player_playback_start_bypos(pos, NULL);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_DACP, "Could not start playback\n");
@@ -969,19 +1308,29 @@ static void
 dacp_reply_playpause(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
 {
   struct daap_session *s;
+  struct player_status status;
   int ret;
 
   s = daap_session_find(req, query, evbuf);
   if (!s)
     return;
 
-  ret = player_playback_start(NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_DACP, "Player returned an error for start after pause\n");
 
-      evhttp_send_error(req, 500, "Internal Server Error");
-      return;
+  player_get_status(&status);
+  if (status.status == PLAY_PLAYING)
+    {
+      player_playback_pause();
+    }
+  else
+    {
+      ret = player_playback_start(NULL);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Player returned an error for start after pause\n");
+
+	  evhttp_send_error(req, 500, "Internal Server Error");
+	  return;
+        }
     }
 
   /* 204 No Content is the canonical reply */
@@ -1025,14 +1374,6 @@ dacp_reply_previtem(struct evhttp_request *req, struct evbuffer *evbuf, char **u
 {
   struct daap_session *s;
   int ret;
-
-  /*
-   * Support (Android) remotes that always send playpause to pause or start a
-   * song.
-   */
-  if(player_is_playing())
-    return dacp_reply_pause(req, evbuf, uri, query);
-
 
   s = daap_session_find(req, query, evbuf);
   if (!s)
@@ -1105,11 +1446,553 @@ dacp_reply_playresume(struct evhttp_request *req, struct evbuffer *evbuf, char *
   evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
 }
 
+static int
+playqueuecontents_add_source(struct evbuffer *songlist, uint32_t source_id, int pos_in_queue, uint32_t plid)
+{
+  struct evbuffer *song;
+  struct media_file_info *mfi;
+  int ret;
+
+  song = evbuffer_new();
+  if (!song)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not allocate song evbuffer for playqueue-contents\n");
+      return -1;
+    }
+
+  mfi = db_file_fetch_byid(source_id);
+  if (!mfi)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not fetch file id %d\n", source_id);
+      mfi = &dummy_mfi;
+    }
+  dmap_add_container(song, "ceQs", 16);
+  dmap_add_raw_uint32(song, 1); /* Database */
+  dmap_add_raw_uint32(song, plid);
+  dmap_add_raw_uint32(song, 0); /* Should perhaps be playlist index? */
+  dmap_add_raw_uint32(song, mfi->id);
+  dmap_add_string(song, "ceQn", mfi->title);
+  dmap_add_string(song, "ceQr", mfi->artist);
+  dmap_add_string(song, "ceQa", mfi->album);
+  dmap_add_string(song, "ceQg", mfi->genre);
+  dmap_add_long(song, "asai", mfi->songalbumid);
+  dmap_add_int(song, "cmmk", mfi->media_kind);
+  dmap_add_int(song, "casa", 1); /* Unknown  */
+  dmap_add_int(song, "astm", mfi->song_length);
+  dmap_add_char(song, "casc", 1); /* Maybe an indication of extra data? */
+  dmap_add_char(song, "caks", 6); /* Unknown */
+  dmap_add_int(song, "ceQI", pos_in_queue);
+
+  dmap_add_container(songlist, "mlit", evbuffer_get_length(song));
+
+  ret = evbuffer_add_buffer(songlist, song);
+  evbuffer_free(song);
+  if (mfi != &dummy_mfi)
+    free_mfi(mfi, 0);
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not add song to songlist for playqueue-contents\n");
+      return ret;
+    }
+
+  return 0;
+}
+
+static void
+dacp_reply_playqueuecontents(struct evhttp_request *req, struct evbuffer *evbuf, char **uri,
+    struct evkeyvalq *query)
+{
+  struct daap_session *s;
+  struct evbuffer *songlist;
+  struct evbuffer *playlists;
+  struct player_status status;
+  struct player_history *history;
+  struct queue *queue;
+  struct queue_item *item;
+  const char *param;
+  size_t songlist_length;
+  size_t playlist_length;
+  int span;
+  int count;
+  int i;
+  int n;
+  int ret;
+  int start_index;
+
+  /* /ctrl-int/1/playqueue-contents?span=50&session-id=... */
+
+  s = daap_session_find(req, query, evbuf);
+  if (!s)
+    return;
+
+  DPRINTF(E_DBG, L_DACP, "Fetching playqueue contents\n");
+
+  span = 50; /* Default */
+  param = evhttp_find_header(query, "span");
+  if (param)
+    {
+      ret = safe_atoi32(param, &span);
+      if (ret < 0)
+	DPRINTF(E_LOG, L_DACP, "Invalid span value in playqueue-contents request\n");
+    }
+
+  i = 0;
+  n = 0; // count of songs in songlist
+  songlist = evbuffer_new();
+  if (!songlist)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not allocate songlist evbuffer for playqueue-contents\n");
+
+      dmap_send_error(req, "ceQR", "Out of memory");
+      return;
+    }
+
+  /*
+   * If the span parameter is negativ make song list for Previously Played,
+   * otherwise make song list for Up Next and begin with first song after playlist position.
+   */
+  if (span < 0)
+    {
+      history = player_history_get();
+      if (abs(span) > history->count)
+	{
+	  start_index = history->start_index;
+	}
+      else
+	{
+	  start_index = (history->start_index + history->count - abs(span)) % MAX_HISTORY_COUNT;
+	}
+      for (n = 0; n < history->count && n < abs(span); n++)
+	{
+	  ret = playqueuecontents_add_source(songlist, history->id[(start_index + n) % MAX_HISTORY_COUNT], (n + 1), status.plid);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_DACP, "Could not add song to songlist for playqueue-contents\n");
+
+	      dmap_send_error(req, "ceQR", "Out of memory");
+	      return;
+	    }
+	}
+    }
+  else
+    {
+      player_get_status(&status);
+
+      queue = player_queue_get_bypos(abs(span));
+      if (queue)
+	{
+	  i = 0;
+	  count = queue_count(queue);
+	  for (n = 0; (n < count) && (n < abs(span)); n++)
+	    {
+	      item = queue_get_byindex(queue, n, 0);
+	      ret = playqueuecontents_add_source(songlist, queueitem_id(item), (n + i + 1), status.plid);
+	      if (ret < 0)
+		{
+		  DPRINTF(E_LOG, L_DACP, "Could not add song to songlist for playqueue-contents\n");
+
+		  dmap_send_error(req, "ceQR", "Out of memory");
+		  return;
+		}
+	    }
+	  queue_free(queue);
+	}
+    }
+
+  /* Playlists are hist, curr and main. */
+  playlists = evbuffer_new();
+  if (!playlists)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not allocate playlists evbuffer for playqueue-contents\n");
+      if (songlist)
+	evbuffer_free(songlist);
+
+      dmap_send_error(req, "ceQR", "Out of memory");
+      return;
+    }
+
+  dmap_add_container(playlists, "mlit", 61);
+  dmap_add_string(playlists, "ceQk", "hist");              /* 12 */
+  dmap_add_int(playlists, "ceQi", -200);                   /* 12 */
+  dmap_add_int(playlists, "ceQm", 200);                    /* 12 */
+  dmap_add_string(playlists, "ceQl", "Previously Played"); /* 25 = 8 + 17 */
+
+  if (songlist)
+    {
+      dmap_add_container(playlists, "mlit", 36);
+      dmap_add_string(playlists, "ceQk", "curr");            /* 12 */
+      dmap_add_int(playlists, "ceQi", 0);                    /* 12 */
+      dmap_add_int(playlists, "ceQm", 1);                    /* 12 */
+
+      dmap_add_container(playlists, "mlit", 69);
+      dmap_add_string(playlists, "ceQk", "main");            /* 12 */
+      dmap_add_int(playlists, "ceQi", 1);                    /* 12 */
+      dmap_add_int(playlists, "ceQm", n);                    /* 12 */
+      dmap_add_string(playlists, "ceQl", "Up Next");         /* 15 = 8 + 7 */
+      dmap_add_string(playlists, "ceQh", "from Music");      /* 18 = 8 + 10 */
+
+      songlist_length = evbuffer_get_length(songlist);
+    }
+  else
+    songlist_length = 0;
+
+  /* Final construction of reply */
+  playlist_length = evbuffer_get_length(playlists);
+  dmap_add_container(evbuf, "ceQR", 79 + playlist_length + songlist_length); /* size of entire container */
+  dmap_add_int(evbuf, "mstt", 200);                                                     /* 12, dmap.status */
+  dmap_add_int(evbuf, "mtco", abs(span));                                               /* 12 */
+  dmap_add_int(evbuf, "mrco", n);                                                       /* 12 */
+  dmap_add_char(evbuf, "ceQu", 0);                                                      /*  9 */
+  dmap_add_container(evbuf, "mlcl", 8 + playlist_length + songlist_length);  /*  8 */
+  dmap_add_container(evbuf, "ceQS", playlist_length);                        /*  8 */
+  ret = evbuffer_add_buffer(evbuf, playlists);
+  evbuffer_free(playlists);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not add playlists to evbuffer for playqueue-contents\n");
+      if (songlist)
+	evbuffer_free(songlist);
+
+      dmap_send_error(req, "ceQR", "Out of memory");
+      return;
+    }
+
+  if (songlist)
+    {
+      ret = evbuffer_add_buffer(evbuf, songlist);
+      evbuffer_free(songlist);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Could not add songlist to evbuffer for playqueue-contents\n");
+
+	  dmap_send_error(req, "ceQR", "Out of memory");
+	  return;
+	}
+    } 
+  dmap_add_char(evbuf, "apsm", status.shuffle); /*  9, daap.playlistshufflemode - not part of mlcl container */
+  dmap_add_char(evbuf, "aprm", status.repeat);  /*  9, daap.playlistrepeatmode  - not part of mlcl container */
+
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+}
+
+static void
+dacp_reply_playqueueedit_clear(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+{
+  const char *param;
+
+  param = evhttp_find_header(query, "mode");
+
+  /*
+   * The mode parameter contains the playlist to be cleared.
+   * If mode=0x68697374 (hex representation of the ascii string "hist") clear the history,
+   * otherwise the current playlist.
+   */
+  if (strcmp(param,"0x68697374") == 0)
+    player_queue_clear_history();
+  else
+    player_queue_clear();
+
+  dmap_add_container(evbuf, "cacr", 24); /* 8 + len */
+  dmap_add_int(evbuf, "mstt", 200);      /* 12 */
+  dmap_add_int(evbuf, "miid", 0);        /* 12 */
+
+  httpd_send_reply(req, HTTP_OK, "OK", evbuf);
+}
+
+static void
+dacp_reply_playqueueedit_add(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+{
+  //?command=add&query='dmap.itemid:156'&sort=album&mode=3&session-id=100
+  // -> mode=3: add to playqueue position 0 (play next)
+  //?command=add&query='dmap.itemid:158'&sort=album&mode=0&session-id=100
+  // -> mode=0: add to end of playqueue
+  //?command=add&query='dmap.itemid:306'&queuefilter=album:6525753023700533274&sort=album&mode=1&session-id=100
+  // -> mode 1: stop playblack, clear playqueue, add songs to playqueue
+  //?command=add&query='dmap.itemid:2'&query-modifier=containers&sort=name&mode=2&session-id=100
+  // -> mode 2: stop playblack, clear playqueue, add shuffled songs from playlist=itemid to playqueue
+
+  struct queue_item *items;
+  const char *editquery;
+  const char *queuefilter;
+  const char *querymodifier;
+  const char *sort;
+  const char *param;
+  char modifiedquery[32];
+  uint32_t idx;
+  int mode;
+  int plid;
+  int ret;
+  int quirkyquery;
+
+  mode = 1;
+
+  param = evhttp_find_header(query, "mode");
+  if (param)
+    {
+      ret = safe_atoi32(param, &mode);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Invalid mode value in playqueue-edit request\n");
+
+	  dmap_send_error(req, "cacr", "Invalid request");
+	  return;
+	}
+    }
+
+  if ((mode == 1) || (mode == 2))
+    {
+      player_playback_stop();
+      player_queue_clear();
+    }
+
+  editquery = evhttp_find_header(query, "query");
+  if (editquery)
+    {
+      sort = evhttp_find_header(query, "sort");
+
+      // if sort param is missing and an album or artist is added to the queue, set sort to "album"
+      if (!sort && (strstr(editquery, "daap.songalbumid:") || strstr(editquery, "daap.songartistid:")))
+      {
+	sort = "album";
+      }
+
+      // only use queryfilter if mode is not equal 0 (add to up next), 3 (play next) or 5 (add to up next)
+      queuefilter = (mode == 0 || mode == 3 || mode == 5) ? NULL : evhttp_find_header(query, "queuefilter");
+
+      querymodifier = evhttp_find_header(query, "query-modifier");
+      if (!querymodifier || (strcmp(querymodifier, "containers") != 0))
+	{
+	  quirkyquery = (mode == 1) && strstr(editquery, "dmap.itemid:") && ((!queuefilter) || strstr(queuefilter, "(null)"));
+	  ret = dacp_queueitem_make(&items, editquery, queuefilter, sort, quirkyquery);
+	}
+      else
+	{
+	  // Modify the query: Take the id from the editquery and use it as a queuefilter playlist id
+	  ret = safe_atoi32(strchr(editquery, ':') + 1, &plid);
+	  if (ret < 0)
+	    {
+	      DPRINTF(E_LOG, L_DACP, "Invalid playlist id in request: %s\n", editquery);
+
+	      dmap_send_error(req, "cacr", "Invalid request");
+	      return;
+	    }
+	  
+	  snprintf(modifiedquery, sizeof(modifiedquery), "playlist:%d", plid);
+	  ret = dacp_queueitem_make(&items, NULL, modifiedquery, sort, 0);
+	}
+
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_DACP, "Could not build song queue\n");
+
+	  dmap_send_error(req, "cacr", "Invalid request");
+	  return;
+	}
+
+      idx = ret;
+
+      if (mode == 3)
+      {
+        player_queue_add_next(items);
+      }
+      else
+      {
+        player_queue_add(items, NULL);
+      }
+    }
+  else
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not add song queue, DACP query missing\n");
+
+      dmap_send_error(req, "cacr", "Invalid request");
+      return;
+    }
+
+  if (mode == 2)
+    {
+      player_shuffle_set(1);
+      idx = 0;
+    }
+
+  DPRINTF(E_DBG, L_DACP, "Song queue built, playback starting at index %" PRIu32 "\n", idx);
+  ret = player_playback_start_bypos(idx, NULL);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not start playback\n");
+
+      dmap_send_error(req, "cacr", "Playback failed to start");
+      return;
+    }
+
+  /* 204 No Content is the canonical reply */
+  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+}
+
+static void
+dacp_reply_playqueueedit_move(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+{
+  /*
+   * Handles the move command.
+   * Exampe request:
+   * playqueue-edit?command=move&edit-params='edit-param.move-pair:3,0'&session-id=100
+   *
+   * The 'edit-param.move-pair' param contains the index of the song in the playqueue to be moved (index 3 in the example)
+   * and the index of the song after which it should be inserted (index 0 in the exampe, the now playing song).
+   */
+  int ret;
+
+  const char *param;
+  int src;
+  int dst;
+
+  param = evhttp_find_header(query, "edit-params");
+  if (param)
+  {
+    ret = safe_atoi32(strchr(param, ':') + 1, &src);
+    if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Invalid edit-params move-from value in playqueue-edit request\n");
+
+      dmap_send_error(req, "cacr", "Invalid request");
+      return;
+    }
+
+    ret = safe_atoi32(strchr(param, ',') + 1, &dst);
+    if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Invalid edit-params move-to value in playqueue-edit request\n");
+
+      dmap_send_error(req, "cacr", "Invalid request");
+      return;
+    }
+
+    player_queue_move_bypos(src, dst);
+  }
+
+  /* 204 No Content is the canonical reply */
+  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+}
+
+static void
+dacp_reply_playqueueedit_remove(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+{
+  /*
+   * Handles the remove command.
+   * Exampe request (removes song at position 1 in the playqueue):
+   * ?command=remove&items=1&session-id=100
+   */
+  int ret;
+
+  const char *param;
+  int item_index;
+
+  param = evhttp_find_header(query, "items");
+  if (param)
+  {
+    ret = safe_atoi32(param, &item_index);
+    if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_DACP, "Invalid edit-params remove item value in playqueue-edit request\n");
+
+      dmap_send_error(req, "cacr", "Invalid request");
+      return;
+    }
+
+    player_queue_remove_bypos(item_index);
+  }
+
+  /* 204 No Content is the canonical reply */
+  evhttp_send_reply(req, HTTP_NOCONTENT, "No Content", evbuf);
+}
+
+static void
+dacp_reply_playqueueedit(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
+{
+  struct daap_session *s;
+  const char *param;
+
+  /*  Variations of /ctrl-int/1/playqueue-edit and expected behaviour
+      User selected play (album or artist tab):
+	?command=add&query='...'&sort=album&mode=1&session-id=...
+	-> clear queue, play query results
+      User selected play (playlist):
+	?command=add&query='dmap.itemid:...'&query-modifier=containers&mode=1&session-id=...
+	-> clear queue, play playlist with the id specified by itemid
+      User selected track (album tab):
+	?command=add&query='dmap.itemid:...'&queuefilter=album:...&sort=album&mode=1&session-id=...
+	-> clear queue, play itemid and the rest of album
+      User selected track (artist tab):
+	?command=add&query='dmap.itemid:...'&queuefilter=artist:...&sort=album&mode=1&session-id=...
+	-> clear queue, play itemid and the rest of artist tracks
+      User selected track (song tab):
+	?command=add&query='dmap.itemid:...'&queuefilter=playlist:...&sort=name&mode=1&session-id=...
+	-> clear queue, play itemid and the rest of playlist
+      User selected track (playlist tab):
+	?command=add&query='dmap.containeritemid:...'&queuefilter=playlist:...&sort=physical&mode=1&session-id=...
+	-> clear queue, play containeritemid and the rest of playlist
+      User selected shuffle (artist tab):
+	?command=add&query='...'&sort=album&mode=2&session-id=...
+	-> clear queue, play shuffled query results
+      User selected add item to queue:
+	?command=add&query='...'&sort=album&mode=0&session-id=...
+	-> add query results to queue
+      User selected play next song (album tab)
+	?command=add&query='daap.songalbumid:...'&sort=album&mode=3&session-id=...
+	-> replace queue from after current song with query results
+      User selected track in queue:
+	?command=playnow&index=...&session-id=...
+	-> play index
+
+      And the quirky query from Remote - no sort and no queuefilter
+      User selected track (Audiobooks):
+	?command=add&query='dmap.itemid:...'&mode=1&session-id=...
+	-> clear queue, play itemid and the rest of album tracks
+
+	?command=move&edit-params='edit-param.move-pair:3,0'&session-id=100
+	-> move song from playqueue position 3 to be played after song at position 0
+	?command=remove&items=1&session-id=100
+  -> remove song on position 1 from the playqueue
+   */
+
+  s = daap_session_find(req, query, evbuf);
+  if (!s)
+    return;
+
+  param = evhttp_find_header(query, "command");
+  if (!param)
+    {
+      DPRINTF(E_LOG, L_DACP, "No command in playqueue-edit request\n");
+
+      dmap_send_error(req, "cmst", "Invalid request");
+      return;
+    }
+
+  if (strcmp(param, "clear") == 0)
+    dacp_reply_playqueueedit_clear(req, evbuf, uri, query);
+  else if (strcmp(param, "playnow") == 0)
+    dacp_reply_cue_play(req, evbuf, uri, query);
+  else if (strcmp(param, "add") == 0)
+    dacp_reply_playqueueedit_add(req, evbuf, uri, query);
+  else if (strcmp(param, "move") == 0)
+    dacp_reply_playqueueedit_move(req, evbuf, uri, query);
+  else if (strcmp(param, "remove") == 0)
+    dacp_reply_playqueueedit_remove(req, evbuf, uri, query);
+  else
+    {
+      DPRINTF(E_LOG, L_DACP, "Unknown playqueue-edit command %s\n", param);
+
+      dmap_send_error(req, "cmst", "Invalid request");
+      return;
+    }
+}
+
 static void
 dacp_reply_playstatusupdate(struct evhttp_request *req, struct evbuffer *evbuf, char **uri, struct evkeyvalq *query)
 {
   struct daap_session *s;
   struct dacp_update_request *ur;
+  struct evhttp_connection *evcon;
   const char *param;
   int reqd_rev;
   int ret;
@@ -1136,7 +2019,7 @@ dacp_reply_playstatusupdate(struct evhttp_request *req, struct evbuffer *evbuf, 
       return;
     }
 
-  if (reqd_rev == 1)
+  if ((reqd_rev == 0) || (reqd_rev == 1))
     {
       ret = make_playstatusupdate(evbuf);
       if (ret < 0)
@@ -1165,7 +2048,9 @@ dacp_reply_playstatusupdate(struct evhttp_request *req, struct evbuffer *evbuf, 
   /* If the connection fails before we have an update to push out
    * to the client, we need to know.
    */
-  evhttp_connection_set_closecb(req->evcon, update_fail_cb, ur);
+  evcon = evhttp_request_get_connection(req);
+  if (evcon)
+    evhttp_connection_set_closecb(evcon, update_fail_cb, ur);
 }
 
 static void
@@ -1173,8 +2058,10 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
 {
   char clen[32];
   struct daap_session *s;
+  struct evkeyvalq *headers;
   const char *param;
   char *ctype;
+  size_t len;
   uint32_t id;
   int max_w;
   int max_h;
@@ -1224,7 +2111,9 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
   if (ret < 0)
     goto no_artwork;
 
-  ret = artwork_get_item(id, max_w, max_h, ART_CAN_PNG | ART_CAN_JPEG, evbuf);
+  ret = artwork_get_item(evbuf, id, max_w, max_h);
+  len = evbuffer_get_length(evbuf);
+
   switch (ret)
     {
       case ART_FMT_PNG:
@@ -1236,16 +2125,17 @@ dacp_reply_nowplayingartwork(struct evhttp_request *req, struct evbuffer *evbuf,
 	break;
 
       default:
-	if (EVBUFFER_LENGTH(evbuf) > 0)
-	  evbuffer_drain(evbuf, EVBUFFER_LENGTH(evbuf));
+	if (len > 0)
+	  evbuffer_drain(evbuf, len);
 
 	goto no_artwork;
     }
 
-  evhttp_remove_header(req->output_headers, "Content-Type");
-  evhttp_add_header(req->output_headers, "Content-Type", ctype);
-  snprintf(clen, sizeof(clen), "%ld", (long)EVBUFFER_LENGTH(evbuf));
-  evhttp_add_header(req->output_headers, "Content-Length", clen);
+  headers = evhttp_request_get_output_headers(req);
+  evhttp_remove_header(headers, "Content-Type");
+  evhttp_add_header(headers, "Content-Type", ctype);
+  snprintf(clen, sizeof(clen), "%ld", (long)len);
+  evhttp_add_header(headers, "Content-Length", clen);
 
   /* No gzip compression for artwork */
   evhttp_send_reply(req, HTTP_OK, "OK", evbuf);
@@ -1267,6 +2157,7 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
   char *ptr;
   char *prop;
   char *propstr;
+  size_t len;
   int ret;
 
   s = daap_session_find(req, query, evbuf);
@@ -1338,7 +2229,8 @@ dacp_reply_getproperty(struct evhttp_request *req, struct evbuffer *evbuf, char 
   if (mfi)
     free_mfi(mfi, 0);
 
-  dmap_add_container(evbuf, "cmgt", 12 + EVBUFFER_LENGTH(proplist)); /* 8 + len */
+  len = evbuffer_get_length(proplist);
+  dmap_add_container(evbuf, "cmgt", 12 + len);
   dmap_add_int(evbuf, "mstt", 200);      /* 12 */
 
   ret = evbuffer_add_buffer(evbuf, proplist);
@@ -1436,6 +2328,7 @@ dacp_reply_getspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
 {
   struct daap_session *s;
   struct evbuffer *spklist;
+  size_t len;
 
   s = daap_session_find(req, query, evbuf);
   if (!s)
@@ -1453,7 +2346,8 @@ dacp_reply_getspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
 
   player_speaker_enumerate(speaker_enum_cb, spklist);
 
-  dmap_add_container(evbuf, "casp", 12 + EVBUFFER_LENGTH(spklist)); /* 8 + len */
+  len = evbuffer_get_length(spklist);
+  dmap_add_container(evbuf, "casp", 12 + len);
   dmap_add_int(evbuf, "mstt", 200); /* 12 */
 
   evbuffer_add_buffer(evbuf, spklist);
@@ -1512,6 +2406,7 @@ dacp_reply_setspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
   do
     {
       param++;
+
       ret = safe_hextou64(param, &ids[i]);
       if (ret < 0)
 	{
@@ -1520,7 +2415,10 @@ dacp_reply_setspeakers(struct evhttp_request *req, struct evbuffer *evbuf, char 
 	  nspk--;
 	  continue;
 	}
-
+      else
+	{
+	  DPRINTF(E_DBG, L_DACP, "Speaker id converted with ret %d, param %s, dec val %" PRIu64 ".\n", ret, param, ids[i]);
+	}
       i++;
     }
   while ((param = strchr(param + 1, ',')));
@@ -1598,6 +2496,14 @@ static struct uri_map dacp_handlers[] =
       .handler = dacp_reply_playstatusupdate
     },
     {
+      .regexp = "^/ctrl-int/[[:digit:]]+/playqueue-contents$",
+      .handler = dacp_reply_playqueuecontents
+    },
+    {
+      .regexp = "^/ctrl-int/[[:digit:]]+/playqueue-edit$",
+      .handler = dacp_reply_playqueueedit
+    },
+    {
       .regexp = "^/ctrl-int/[[:digit:]]+/nowplayingartwork$",
       .handler = dacp_reply_nowplayingartwork
     },
@@ -1632,6 +2538,7 @@ dacp_request(struct evhttp_request *req)
   char *uri_parts[7];
   struct evbuffer *evbuf;
   struct evkeyvalq query;
+  struct evkeyvalq *headers;
   int handler;
   int ret;
   int i;
@@ -1723,9 +2630,10 @@ dacp_request(struct evhttp_request *req)
 
   evhttp_parse_query(full_uri, &query);
 
-  evhttp_add_header(req->output_headers, "DAAP-Server", "forked-daapd/" VERSION);
+  headers = evhttp_request_get_output_headers(req);
+  evhttp_add_header(headers, "DAAP-Server", "forked-daapd/" VERSION);
   /* Content-Type for all DACP replies; can be overriden as needed */
-  evhttp_add_header(req->output_headers, "Content-Type", "application/x-dmap-tagged");
+  evhttp_add_header(headers, "Content-Type", "application/x-dmap-tagged");
 
   dacp_handlers[handler].handler(req, evbuf, uri_parts, &query);
 
@@ -1766,7 +2674,7 @@ dacp_init(void)
       return -1;
     }
 #else
-# if defined(__linux__)
+# ifdef HAVE_PIPE2
   ret = pipe2(update_pipe, O_CLOEXEC);
 # else
   ret = pipe(update_pipe);
@@ -1792,14 +2700,27 @@ dacp_init(void)
     }
 
 #ifdef USE_EVENTFD
-  event_set(&updateev, update_efd, EV_READ, playstatusupdate_cb, NULL);
+  updateev = event_new(evbase_httpd, update_efd, EV_READ, playstatusupdate_cb, NULL);
 #else
-  event_set(&updateev, update_pipe[0], EV_READ, playstatusupdate_cb, NULL);
+  updateev = event_new(evbase_httpd, update_pipe[0], EV_READ, playstatusupdate_cb, NULL);
 #endif
-  event_base_set(evbase_httpd, &updateev);
-  event_add(&updateev, NULL);
+  if (!updateev)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not create update event\n");
 
-  player_set_update_handler(dacp_playstatus_update_handler);
+      return -1;
+    }
+  event_add(updateev, NULL);
+
+  seek_timer = evtimer_new(evbase_httpd, seek_timer_cb, NULL);
+  if (!seek_timer)
+    {
+      DPRINTF(E_LOG, L_DACP, "Could not create seek_timer event\n");
+
+      return -1;
+    }
+
+  listener_add(dacp_playstatus_update_handler, LISTENER_PLAYER);
 
   return 0;
 
@@ -1817,9 +2738,12 @@ void
 dacp_deinit(void)
 {
   struct dacp_update_request *ur;
+  struct evhttp_connection *evcon;
   int i;
 
-  player_set_update_handler(NULL);
+  listener_remove(dacp_playstatus_update_handler);
+
+  event_free(seek_timer);
 
   for (i = 0; dacp_handlers[i].handler; i++)
     regfree(&dacp_handlers[i].preg);
@@ -1828,16 +2752,17 @@ dacp_deinit(void)
     {
       update_requests = ur->next;
 
-      if (ur->req->evcon)
+      evcon = evhttp_request_get_connection(ur->req);
+      if (evcon)
 	{
-	  evhttp_connection_set_closecb(ur->req->evcon, NULL, NULL);
-	  evhttp_connection_free(ur->req->evcon);
+	  evhttp_connection_set_closecb(evcon, NULL, NULL);
+	  evhttp_connection_free(evcon);
 	}
 
       free(ur);
     }
 
-  event_del(&updateev);
+  event_free(updateev);
 
 #ifdef USE_EVENTFD
   close(update_efd);

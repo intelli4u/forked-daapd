@@ -52,7 +52,7 @@ static cfg_opt_t sec_general[] =
     CFG_STR("db_pragma_journal_mode", NULL, CFGF_NONE),
     CFG_INT("db_pragma_synchronous", -1, CFGF_NONE),
     CFG_INT_CB("loglevel", E_LOG, CFGF_NONE, &cb_loglevel),
-    CFG_BOOL("ipv6", cfg_false, CFGF_NONE),
+    CFG_BOOL("ipv6", cfg_true, CFGF_NONE),
     CFG_STR("cache_path", STATEDIR "/cache/" PACKAGE "/cache.db", CFGF_NONE),
     CFG_INT("cache_daap_threshold", 1000, CFGF_NONE),
     CFG_END()
@@ -69,6 +69,7 @@ static cfg_opt_t sec_library[] =
     CFG_STR_LIST("audiobooks", NULL, CFGF_NONE),
     CFG_STR_LIST("compilations", NULL, CFGF_NONE),
     CFG_STR("compilation_artist", NULL, CFGF_NONE),
+    CFG_BOOL("hide_singles", cfg_false, CFGF_NONE),
     CFG_BOOL("radio_playlists", cfg_false, CFGF_NONE),
     CFG_STR("name_library", "Library", CFGF_NONE),
     CFG_STR("name_music", "Music", CFGF_NONE),
@@ -83,8 +84,8 @@ static cfg_opt_t sec_library[] =
     CFG_STR_LIST("filepath_ignore", NULL, CFGF_NONE),
     CFG_BOOL("filescan_disable", cfg_false, CFGF_NONE),
     CFG_BOOL("itunes_overrides", cfg_false, CFGF_NONE),
-    CFG_STR_LIST("no_transcode", NULL, CFGF_NONE),
-    CFG_STR_LIST("force_transcode", NULL, CFGF_NONE),
+    CFG_STR_LIST("no_decode", NULL, CFGF_NONE),
+    CFG_STR_LIST("force_decode", NULL, CFGF_NONE),
     CFG_END()
   };
 
@@ -92,12 +93,10 @@ static cfg_opt_t sec_library[] =
 static cfg_opt_t sec_audio[] =
   {
     CFG_STR("nickname", "Computer", CFGF_NONE),
-#ifdef __linux__
+    CFG_STR("type", NULL, CFGF_NONE),
     CFG_STR("card", "default", CFGF_NONE),
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-    CFG_STR("card", "/dev/dsp", CFGF_NONE),
-#endif
     CFG_STR("mixer", NULL, CFGF_NONE),
+    CFG_INT("offset", 0, CFGF_NONE),
     CFG_END()
   };
 
@@ -117,9 +116,7 @@ static cfg_opt_t sec_spotify[] =
     CFG_INT("bitrate", 0, CFGF_NONE),
     CFG_BOOL("base_playlist_disable", cfg_false, CFGF_NONE),
     CFG_BOOL("artist_override", cfg_false, CFGF_NONE),
-    CFG_BOOL("starred_artist_override", cfg_false, CFGF_NONE),
     CFG_BOOL("album_override", cfg_false, CFGF_NONE),
-    CFG_BOOL("starred_album_override", cfg_false, CFGF_NONE),
     CFG_END()
   };
 
@@ -138,6 +135,8 @@ static cfg_opt_t sec_sqlite[] =
 static cfg_opt_t sec_mpd[] =
   {
     CFG_INT("port", 6600, CFGF_NONE),
+    CFG_INT("http_port", 0, CFGF_NONE),
+    CFG_BOOL("clear_queue_on_stop_disable", cfg_false, CFGF_NONE),
     CFG_END()
   };
 
@@ -326,8 +325,8 @@ conffile_load(char *file)
 
   /* Resolve runas username */
   runas = cfg_getstr(cfg_getsec(cfg, "general"), "uid");
-  pw = getpwnam("admin");
-  if (!pw) 
+  pw = getpwnam(runas);
+  if (!pw)
     {
       DPRINTF(E_FATAL, L_CONF, "Could not lookup user %s: %s\n", runas, strerror(errno));
 

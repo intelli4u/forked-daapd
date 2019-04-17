@@ -29,7 +29,7 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
-#include <event.h>
+#include <event2/event.h>
 
 #include <libavutil/log.h>
 
@@ -43,7 +43,8 @@ static int threshold;
 static int console;
 static char *logfilename;
 static FILE *logfile;
-static char *labels[] = { "config", "daap", "db", "httpd", "main", "mdns", "misc", "rsp", "scan", "xcode", "event", "remote", "dacp", "ffmpeg", "artwork", "player", "raop", "laudio", "dmap", "dbperf" };
+static char *labels[] = { "config", "daap", "db", "httpd", "http", "main", "mdns", "misc", "rsp", "scan", "xcode", "event", "remote", "dacp", "ffmpeg", "artwork", "player", "raop", "laudio", "dmap", "dbperf", "spotify", "lastfm", "cache", "mpd", "stream", "cast" };
+static char *severities[] = { "FATAL", "LOG", "WARN", "INFO", "DEBUG", "SPAM" };
 
 
 static int
@@ -86,7 +87,6 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
   time_t t;
   int ret;
 
-
   if (!((1 << domain) & logdomains) || (severity > threshold))
     return;
 
@@ -105,7 +105,7 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
       if (ret == 0)
 	stamp[0] = '\0';
 
-      fprintf(logfile, "[%s] %8s: ", stamp, labels[domain]);
+      fprintf(logfile, "[%s] [%5s] %8s: ", stamp, severities[severity], labels[domain]);
 
       va_copy(ap, args);
       vfprintf(logfile, fmt, ap);
@@ -114,9 +114,9 @@ vlogger(int severity, int domain, const char *fmt, va_list args)
       fflush(logfile);
     }
 
-  if (1)
+  if (console)
     {
-      fprintf(stderr, "%8s: ", labels[domain]);
+      fprintf(stderr, "[%5s] %8s: ", severities[severity], labels[domain]);
 
       va_copy(ap, args);
       vfprintf(stderr, fmt, ap);
@@ -141,17 +141,16 @@ logger_ffmpeg(void *ptr, int level, const char *fmt, va_list ap)
 {
   int severity;
 
-  /* Can't use a switch() because some definitions have the same value */
-  if ((level == AV_LOG_FATAL) || (level == AV_LOG_ERROR))
+  if (level <= AV_LOG_FATAL)
     severity = E_LOG;
-  else if ((level == AV_LOG_WARNING) || (level == AV_LOG_INFO) || (level == AV_LOG_VERBOSE))
+  else if (level <= AV_LOG_WARNING)
     severity = E_WARN;
-  else if (level == AV_LOG_DEBUG)
+  else if (level <= AV_LOG_VERBOSE)
+    severity = E_INFO;
+  else if (level <= AV_LOG_DEBUG)
     severity = E_DBG;
-  else if (level == AV_LOG_QUIET)
-    severity = E_SPAM;
   else
-    severity = E_LOG;
+    severity = E_SPAM;
 
   vlogger(severity, L_FFMPEG, fmt, ap);
 }
@@ -161,19 +160,19 @@ logger_libevent(int severity, const char *msg)
 {
   switch (severity)
     {
-      case _EVENT_LOG_DEBUG:
+      case EVENT_LOG_DEBUG:
 	severity = E_DBG;
 	break;
 
-      case _EVENT_LOG_ERR:
+      case EVENT_LOG_ERR:
 	severity = E_LOG;
 	break;
 
-      case _EVENT_LOG_WARN:
+      case EVENT_LOG_WARN:
 	severity = E_WARN;
 	break;
 
-      case _EVENT_LOG_MSG:
+      case EVENT_LOG_MSG:
 	severity = E_INFO;
 	break;
 
@@ -185,7 +184,7 @@ logger_libevent(int severity, const char *msg)
   DPRINTF(severity, L_EVENT, "%s\n", msg);
 }
 
-#ifdef LAUDIO_USE_ALSA
+#ifdef ALSA
 void
 logger_alsa(const char *file, int line, const char *function, int err, const char *fmt, ...)
 {
@@ -195,7 +194,7 @@ logger_alsa(const char *file, int line, const char *function, int err, const cha
   vlogger(E_LOG, L_LAUDIO, fmt, ap);
   va_end(ap);
 }
-#endif /* LAUDIO_USE_ALSA */
+#endif /* ALSA */
 
 void
 logger_reinit(void)

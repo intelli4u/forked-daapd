@@ -24,7 +24,6 @@
 
 #include <libavformat/avformat.h>
 
-#include "evbuffer/evbuffer.h"
 #include "logger.h"
 #include "avio_evbuffer.h"
 
@@ -39,6 +38,18 @@ struct avio_evbuffer {
   uint8_t *buffer;
 };
 
+static int
+avio_evbuffer_read(void *opaque, uint8_t *buf, int size)
+{
+  struct avio_evbuffer *ae;
+  int ret;
+
+  ae = (struct avio_evbuffer *)opaque;
+
+  ret = evbuffer_remove(ae->evbuf, buf, size);
+
+  return ret;
+}
 
 static int
 avio_evbuffer_write(void *opaque, uint8_t *buf, int size)
@@ -53,8 +64,8 @@ avio_evbuffer_write(void *opaque, uint8_t *buf, int size)
   return (ret == 0) ? size : -1;
 }
 
-AVIOContext *
-avio_evbuffer_open(struct evbuffer *evbuf)
+static AVIOContext *
+avio_evbuffer_open(struct evbuffer *evbuf, int is_output)
 {
   struct avio_evbuffer *ae;
   AVIOContext *s;
@@ -78,7 +89,11 @@ avio_evbuffer_open(struct evbuffer *evbuf)
 
   ae->evbuf = evbuf;
 
-  s = avio_alloc_context(ae->buffer, BUFFER_SIZE, 1, ae, NULL, avio_evbuffer_write, NULL);
+  if (is_output)
+    s = avio_alloc_context(ae->buffer, BUFFER_SIZE, 1, ae, NULL, avio_evbuffer_write, NULL);
+  else
+    s = avio_alloc_context(ae->buffer, BUFFER_SIZE, 0, ae, avio_evbuffer_read, NULL, NULL);
+
   if (!s)
     {
       DPRINTF(E_LOG, L_FFMPEG, "Could not allocate AVIOContext\n");
@@ -93,6 +108,18 @@ avio_evbuffer_open(struct evbuffer *evbuf)
   return s;
 }
 
+AVIOContext *
+avio_input_evbuffer_open(struct evbuffer *evbuf)
+{
+  return avio_evbuffer_open(evbuf, 0);
+}
+
+AVIOContext *
+avio_output_evbuffer_open(struct evbuffer *evbuf)
+{
+  return avio_evbuffer_open(evbuf, 1);
+}
+
 void
 avio_evbuffer_close(AVIOContext *s)
 {
@@ -102,7 +129,7 @@ avio_evbuffer_close(AVIOContext *s)
 
   avio_flush(s);
 
-  av_free(ae->buffer);
+  av_free(s->buffer);
   free(ae);
 
   av_free(s);

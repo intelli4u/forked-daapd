@@ -2,18 +2,18 @@
 #ifndef __CACHE_H__
 #define __CACHE_H__
 
-#ifdef HAVE_LIBEVENT2
-# include <event2/event.h>
-# include <event2/buffer.h>
-#else
-# include <event.h>
-#endif
-
+#include <event2/buffer.h>
 
 /* ---------------------------- DAAP cache API  --------------------------- */
 
 void
 cache_daap_trigger(void);
+
+void
+cache_daap_suspend(void);
+
+void
+cache_daap_resume(void);
 
 int
 cache_daap_get(const char *query, struct evbuffer *evbuf);
@@ -30,8 +30,8 @@ cache_daap_threshold(void);
 #define CACHE_ARTWORK_GROUP 0
 #define CACHE_ARTWORK_INDIVIDUAL 1
 
-int
-cache_artwork_ping(char *path, time_t mtime);
+void
+cache_artwork_ping(char *path, time_t mtime, int del);
 
 int
 cache_artwork_delete_by_path(char *path);
@@ -45,6 +45,11 @@ cache_artwork_add(int type, int64_t persistentid, int max_w, int max_h, int form
 int
 cache_artwork_get(int type, int64_t persistentid, int max_w, int max_h, int *cached, int *format, struct evbuffer *evbuf);
 
+int
+cache_artwork_stash(struct evbuffer *evbuf, char *path, int format);
+
+int
+cache_artwork_read(struct evbuffer *evbuf, char *path, int *format);
 
 /* ---------------------------- Cache API  --------------------------- */
 

@@ -55,6 +55,12 @@ daap_query_parse_sql(const char *daap_query)
 
   char *ret = NULL;
 
+  if (!daap_query)
+    {
+      DPRINTF(E_LOG, L_DAAP, "DAAP query is null\n");
+      return NULL;
+    }
+
   DPRINTF(E_DBG, L_DAAP, "Trying DAAP query -%s-\n", daap_query);
 
 #if ANTLR3C_NEW_INPUT
@@ -130,7 +136,7 @@ daap_query_parse_sql(const char *daap_query)
     }
   else
     {
-      DPRINTF(E_LOG, L_DAAP, "Invalid DAAP query\n");
+      DPRINTF(E_LOG, L_DAAP, "Invalid DAAP query -%s-\n", daap_query);
       ret = NULL;
     }
 

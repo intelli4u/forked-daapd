@@ -30,6 +30,11 @@
 #include <time.h>
 #include <string.h>
 #include <pthread.h>
+#ifdef HAVE_PTHREAD_NP_H
+# include <pthread_np.h>
+#endif
+
+#include <event2/event.h>
 
 #include "conffile.h"
 #include "logger.h"
@@ -60,12 +65,13 @@ struct cache_command
 
     char *path;  // artwork path
     int type;    // individual or group artwork
-    int64_t peristentid;
+    int64_t persistentid;
     int max_w;
     int max_h;
     int format;
     time_t mtime;
     int cached;
+    int del;
 
     struct evbuffer *evbuf;
   } arg;
@@ -91,8 +97,18 @@ static int g_initialized;
 static sqlite3 *g_db_hdl;
 static char *g_db_path;
 
+// Global artwork stash
+struct stash
+{
+  char *path;
+  int format;
+  size_t size;
+  uint8_t *data;
+} g_stash;
+
 // After being triggered wait 60 seconds before rebuilding cache
 static struct timeval g_wait = { 60, 0 };
+static int g_suspended;
 
 // The user may configure a threshold (in msec), and queries slower than
 // that will have their reply cached
@@ -330,8 +346,10 @@ cache_create_tables(void)
       sqlite3_close(g_db_hdl);
       return -1;
     }
+
   query = sqlite3_mprintf(Q_CACHE_VERSION, CACHE_VERSION);
   ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+  sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_FATAL, L_CACHE, "Error inserting cache version: %s\n", errmsg);
@@ -340,8 +358,6 @@ cache_create_tables(void)
       sqlite3_close(g_db_hdl);
       return -1;
     }
-
-  sqlite3_free(query);
 
   DPRINTF(E_DBG, L_CACHE, "Cache tables created\n");
 
@@ -570,6 +586,7 @@ cache_create(void)
     {
       query = sqlite3_mprintf(Q_PRAGMA_CACHE_SIZE, cache_size);
       ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+      sqlite3_free(query);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_LOG, L_CACHE, "Error setting pragma_cache_size_cache: %s\n", errmsg);
@@ -586,6 +603,7 @@ cache_create(void)
     {
       query = sqlite3_mprintf(Q_PRAGMA_JOURNAL_MODE, journal_mode);
       ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+      sqlite3_free(query);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_LOG, L_CACHE, "Error setting pragma_journal_mode: %s\n", errmsg);
@@ -602,6 +620,7 @@ cache_create(void)
     {
       query = sqlite3_mprintf(Q_PRAGMA_SYNCHRONOUS, synchronous);
       ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+      sqlite3_free(query);
       if (ret != SQLITE_OK)
 	{
 	  DPRINTF(E_LOG, L_CACHE, "Error setting pragma_synchronous: %s\n", errmsg);
@@ -647,13 +666,8 @@ cache_daap_reply_add(const char *query, struct evbuffer *evbuf)
   size_t datalen;
   int ret;
 
-#ifdef HAVE_LIBEVENT2
   datalen = evbuffer_get_length(evbuf);
   data = evbuffer_pullup(evbuf, -1);
-#else
-  datalen = EVBUFFER_LENGTH(evbuf);
-  data = EVBUFFER_DATA(evbuf);
-#endif
 
   ret = sqlite3_prepare_v2(g_db_hdl, Q_TMPL, -1, &stmt, 0);
   if (ret != SQLITE_OK)
@@ -722,16 +736,14 @@ cache_daap_query_add(struct cache_command *cmd)
     }
 
   ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+  sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Error adding query to query list: %s\n", errmsg);
 
-      sqlite3_free(query);
       sqlite3_free(errmsg);
       goto error_add;
     }
-
-  sqlite3_free(query);
 
   DPRINTF(E_INFO, L_CACHE, "Slow query (%d ms) added to cache: '%s' (user-agent: '%s')\n", cmd->arg.msec, cmd->arg.query, cmd->arg.ua);
 
@@ -828,6 +840,31 @@ cache_daap_query_get(struct cache_command *cmd)
 #undef Q_TMPL
 }
 
+/* Removes the query from the cache */
+static int
+cache_daap_query_delete(const int id)
+{
+#define Q_TMPL "DELETE FROM queries WHERE id = %d;"
+  char *query;
+  char *errmsg;
+  int ret;
+
+  query = sqlite3_mprintf(Q_TMPL, id);
+
+  ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+  sqlite3_free(query);
+  if (ret != SQLITE_OK)
+    {
+      DPRINTF(E_LOG, L_CACHE, "Error deleting query from cache: %s\n", errmsg);
+
+      sqlite3_free(errmsg);
+      return -1;
+    }
+
+  return 0;
+#undef Q_TMPL
+}
+
 /* Here we actually update the cache by asking httpd_daap for responses
  * to the queries set for caching
  */
@@ -850,7 +887,7 @@ cache_daap_update_cb(int fd, short what, void *arg)
       return;
     }
 
-  ret = sqlite3_prepare_v2(g_db_hdl, "SELECT user_agent, query FROM queries;", -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(g_db_hdl, "SELECT id, user_agent, query FROM queries;", -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Error preparing for cache update: %s\n", sqlite3_errmsg(g_db_hdl));
@@ -859,13 +896,15 @@ cache_daap_update_cb(int fd, short what, void *arg)
 
   while ((ret = sqlite3_step(stmt)) == SQLITE_ROW)
     {
-      query = strdup((char *)sqlite3_column_text(stmt, 1));
+      query = strdup((char *)sqlite3_column_text(stmt, 2));
 
-      evbuf = daap_reply_build(query, (char *)sqlite3_column_text(stmt, 0));
+      evbuf = daap_reply_build(query, (char *)sqlite3_column_text(stmt, 1));
       if (!evbuf)
 	{
 	  DPRINTF(E_LOG, L_CACHE, "Error building DAAP reply for query: %s\n", query);
+	  cache_daap_query_delete(sqlite3_column_int(stmt, 0));
 	  free(query);
+
 	  continue;
 	}
 
@@ -898,6 +937,30 @@ cache_daap_update_timer(struct cache_command *cmd)
   return 0;
 }
 
+static int
+cache_daap_suspend_timer(struct cache_command *cmd)
+{
+  if (!g_cacheev)
+    return -1;
+
+  g_suspended = evtimer_pending(g_cacheev, NULL);
+  if (g_suspended)
+    evtimer_del(g_cacheev);
+
+  return 0;
+}
+
+static int
+cache_daap_resume_timer(struct cache_command *cmd)
+{
+  if (!g_cacheev)
+    return -1;
+
+  if (g_suspended)
+    evtimer_add(g_cacheev, &g_wait);
+
+  return 0;
+}
 
 /*
  * Updates cached timestamps to current time for all cache entries for the given path, if the file was not modfied
@@ -923,35 +986,40 @@ cache_artwork_ping_impl(struct cache_command *cmd)
   DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
 
   ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+  sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Query error: %s\n", errmsg);
 
-      sqlite3_free(errmsg);
-      sqlite3_free(query);
-      return -1;
+      goto error_ping;
     }
 
-  sqlite3_free(query);
-
-  query = sqlite3_mprintf(Q_TMPL_DEL, cmd->arg.path, (int64_t)cmd->arg.mtime);
-
-  DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
-
-  ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
-  if (ret != SQLITE_OK)
+  if (cmd->arg.del > 0)
     {
-      DPRINTF(E_LOG, L_CACHE, "Query error: %s\n", errmsg);
+      query = sqlite3_mprintf(Q_TMPL_DEL, cmd->arg.path, (int64_t)cmd->arg.mtime);
 
-      sqlite3_free(errmsg);
+      DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
+
+      ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
       sqlite3_free(query);
-      return -1;
+      if (ret != SQLITE_OK)
+	{
+	  DPRINTF(E_LOG, L_CACHE, "Query error: %s\n", errmsg);
+
+	  goto error_ping;
+	}
     }
 
-  sqlite3_free(query);
+  free(cmd->arg.path);
 
   return 0;
 
+ error_ping:
+  sqlite3_free(errmsg);
+  free(cmd->arg.path);
+
+  return -1;
+  
 #undef Q_TMPL_PING
 #undef Q_TMPL_DEL
 }
@@ -976,16 +1044,16 @@ cache_artwork_delete_by_path_impl(struct cache_command *cmd)
   DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
 
   ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+  sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Query error: %s\n", errmsg);
 
       sqlite3_free(errmsg);
-      sqlite3_free(query);
       return -1;
     }
 
-  sqlite3_free(query);
+  DPRINTF(E_DBG, L_CACHE, "Deleted %d rows\n", sqlite3_changes(g_db_hdl));
 
   return 0;
 
@@ -1012,18 +1080,16 @@ cache_artwork_purge_cruft_impl(struct cache_command *cmd)
   DPRINTF(E_DBG, L_CACHE, "Running purge query '%s'\n", query);
 
   ret = sqlite3_exec(g_db_hdl, query, NULL, NULL, &errmsg);
+  sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Query error: %s\n", errmsg);
 
       sqlite3_free(errmsg);
-      sqlite3_free(query);
       return -1;
     }
 
   DPRINTF(E_DBG, L_CACHE, "Purged %d rows\n", sqlite3_changes(g_db_hdl));
-
-  sqlite3_free(query);
 
   return 0;
 
@@ -1059,15 +1125,10 @@ cache_artwork_add_impl(struct cache_command *cmd)
       return -1;
     }
 
-#ifdef HAVE_LIBEVENT2
   datalen = evbuffer_get_length(cmd->arg.evbuf);
   data = evbuffer_pullup(cmd->arg.evbuf, -1);
-#else
-  datalen = EVBUFFER_LENGTH(cmd->arg.evbuf);
-  data = EVBUFFER_DATA(cmd->arg.evbuf);
-#endif
 
-  sqlite3_bind_int64(stmt, 1, cmd->arg.peristentid);
+  sqlite3_bind_int64(stmt, 1, cmd->arg.persistentid);
   sqlite3_bind_int(stmt, 2, cmd->arg.max_w);
   sqlite3_bind_int(stmt, 3, cmd->arg.max_h);
   sqlite3_bind_int(stmt, 4, cmd->arg.format);
@@ -1118,7 +1179,7 @@ cache_artwork_get_impl(struct cache_command *cmd)
   int datalen;
   int ret;
 
-  query = sqlite3_mprintf(Q_TMPL, cmd->arg.type, cmd->arg.peristentid, cmd->arg.max_w, cmd->arg.max_h);
+  query = sqlite3_mprintf(Q_TMPL, cmd->arg.type, cmd->arg.persistentid, cmd->arg.max_w, cmd->arg.max_h);
   if (!query)
     {
       DPRINTF(E_LOG, L_CACHE, "Out of memory for query string\n");
@@ -1126,6 +1187,7 @@ cache_artwork_get_impl(struct cache_command *cmd)
     }
 
   DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
+
   ret = sqlite3_prepare_v2(g_db_hdl, query, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
@@ -1158,6 +1220,7 @@ cache_artwork_get_impl(struct cache_command *cmd)
   if (!cmd->arg.evbuf)
     {
       DPRINTF(E_LOG, L_CACHE, "Error: Artwork evbuffer is NULL\n");
+      ret = -1;
       goto error_get;
     }
 
@@ -1165,6 +1228,7 @@ cache_artwork_get_impl(struct cache_command *cmd)
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_CACHE, "Out of memory for artwork evbuffer\n");
+      ret = -1;
       goto error_get;
     }
 
@@ -1176,14 +1240,64 @@ cache_artwork_get_impl(struct cache_command *cmd)
 
   DPRINTF(E_DBG, L_CACHE, "Cache hit: %s\n", query);
 
+  sqlite3_free(query);
+
   return 0;
 
  error_get:
   sqlite3_finalize(stmt);
-  return -1;
+  sqlite3_free(query);
+
+  return ret;
 #undef Q_TMPL
 }
 
+static int
+cache_artwork_stash_impl(struct cache_command *cmd)
+{
+  /* Clear current stash */
+  if (g_stash.path)
+    {
+      free(g_stash.path);
+      free(g_stash.data);
+      memset(&g_stash, 0, sizeof(struct stash));
+    }
+
+  g_stash.size = evbuffer_get_length(cmd->arg.evbuf);
+  g_stash.data = malloc(g_stash.size);
+  if (!g_stash.data)
+    {
+      DPRINTF(E_LOG, L_CACHE, "Out of memory for artwork stash data\n");
+      return -1;
+    }
+
+  g_stash.path = strdup(cmd->arg.path);
+  if (!g_stash.path)
+    {
+      DPRINTF(E_LOG, L_CACHE, "Out of memory for artwork stash path\n");
+      free(g_stash.data);
+      return -1;
+    }
+
+  g_stash.format = cmd->arg.format;
+
+  return evbuffer_copyout(cmd->arg.evbuf, g_stash.data, g_stash.size);
+}
+
+static int
+cache_artwork_read_impl(struct cache_command *cmd)
+{
+  cmd->arg.format = 0;
+
+  if (!g_stash.path || !g_stash.data || (strcmp(g_stash.path, cmd->arg.path) != 0))
+    return -1;
+
+  cmd->arg.format = g_stash.format;
+
+  DPRINTF(E_DBG, L_CACHE, "Stash hit (format %d, size %zu): %s\n", g_stash.format, g_stash.size, g_stash.path);
+
+  return evbuffer_add(cmd->arg.evbuf, g_stash.data, g_stash.size);
+}
 
 static void *
 cache(void *arg)
@@ -1311,6 +1425,54 @@ cache_daap_trigger(void)
   nonblock_command(cmd);
 }
 
+void
+cache_daap_suspend(void)
+{
+  struct cache_command *cmd;
+
+  if (!g_initialized)
+    return;
+
+  cmd = (struct cache_command *)malloc(sizeof(struct cache_command));
+  if (!cmd)
+    {
+      DPRINTF(E_LOG, L_CACHE, "Could not allocate cache_command\n");
+      return;
+    }
+
+  memset(cmd, 0, sizeof(struct cache_command));
+
+  cmd->nonblock = 1;
+
+  cmd->func = cache_daap_suspend_timer;
+
+  nonblock_command(cmd);
+}
+
+void
+cache_daap_resume(void)
+{
+  struct cache_command *cmd;
+
+  if (!g_initialized)
+    return;
+
+  cmd = (struct cache_command *)malloc(sizeof(struct cache_command));
+  if (!cmd)
+    {
+      DPRINTF(E_LOG, L_CACHE, "Could not allocate cache_command\n");
+      return;
+    }
+
+  memset(cmd, 0, sizeof(struct cache_command));
+
+  cmd->nonblock = 1;
+
+  cmd->func = cache_daap_resume_timer;
+
+  nonblock_command(cmd);
+}
+
 int
 cache_daap_get(const char *query, struct evbuffer *evbuf)
 {
@@ -1381,26 +1543,31 @@ cache_daap_threshold(void)
  * @param del if > 0 cached entries for the given path are deleted if the cached timestamp (db_timestamp) is older than mtime
  * @return 0 if successful, -1 if an error occurred
  */
-int
-cache_artwork_ping(char *path, time_t mtime)
+void
+cache_artwork_ping(char *path, time_t mtime, int del)
 {
-  struct cache_command cmd;
-  int ret;
+  struct cache_command *cmd;
 
   if (!g_initialized)
-    return -1;
+    return;
 
-  command_init(&cmd);
+  cmd = (struct cache_command *)malloc(sizeof(struct cache_command));
+  if (!cmd)
+    {
+      DPRINTF(E_LOG, L_CACHE, "Could not allocate cache_command\n");
+      return;
+    }
 
-  cmd.func = cache_artwork_ping_impl;
-  cmd.arg.path = strdup(path);
-  cmd.arg.mtime = mtime;
+  memset(cmd, 0, sizeof(struct cache_command));
 
-  ret = sync_command(&cmd);
+  cmd->nonblock = 1;
 
-  command_deinit(&cmd);
+  cmd->func = cache_artwork_ping_impl;
+  cmd->arg.path = strdup(path);
+  cmd->arg.mtime = mtime;
+  cmd->arg.del = del;
 
-  return ret;
+  nonblock_command(cmd);
 }
 
 /*
@@ -1421,7 +1588,7 @@ cache_artwork_delete_by_path(char *path)
   command_init(&cmd);
 
   cmd.func = cache_artwork_delete_by_path_impl;
-  cmd.arg.path = strdup(path);
+  cmd.arg.path = path;
 
   ret = sync_command(&cmd);
 
@@ -1482,11 +1649,11 @@ cache_artwork_add(int type, int64_t persistentid, int max_w, int max_h, int form
 
   cmd.func = cache_artwork_add_impl;
   cmd.arg.type = type;
-  cmd.arg.peristentid = persistentid;
+  cmd.arg.persistentid = persistentid;
   cmd.arg.max_w = max_w;
   cmd.arg.max_h = max_h;
   cmd.arg.format = format;
-  cmd.arg.path = strdup(filename);
+  cmd.arg.path = filename;
   cmd.arg.evbuf = evbuf;
 
   ret = sync_command(&cmd);
@@ -1517,13 +1684,17 @@ cache_artwork_get(int type, int64_t persistentid, int max_w, int max_h, int *cac
   int ret;
 
   if (!g_initialized)
-    return -1;
+    {
+      *cached = 0;
+      *format = 0;
+      return 0;
+    }
 
   command_init(&cmd);
 
   cmd.func = cache_artwork_get_impl;
   cmd.arg.type = type;
-  cmd.arg.peristentid = persistentid;
+  cmd.arg.persistentid = persistentid;
   cmd.arg.max_w = max_w;
   cmd.arg.max_h = max_h;
   cmd.arg.evbuf = evbuf;
@@ -1538,6 +1709,68 @@ cache_artwork_get(int type, int64_t persistentid, int max_w, int max_h, int *cac
   return ret;
 }
 
+/*
+ * Put an artwork image in the in-memory stash (the previous will be deleted)
+ *
+ * @param evbuf event buffer with the cached image to cache
+ * @param path the source (url) of the image to stash
+ * @param format the format of the image
+ * @return 0 if successful, -1 if an error occurred
+ */
+int
+cache_artwork_stash(struct evbuffer *evbuf, char *path, int format)
+{
+  struct cache_command cmd;
+  int ret;
+
+  if (!g_initialized)
+    return -1;
+
+  command_init(&cmd);
+
+  cmd.func = cache_artwork_stash_impl;
+  cmd.arg.evbuf = evbuf;
+  cmd.arg.path = path;
+  cmd.arg.format = format;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Read the cached artwork image in the in-memory stash into evbuffer
+ *
+ * @param evbuf event buffer filled by this function with the cached image
+ * @param path this function will check that the path matches the cached image's path
+ * @param format set by this function to the format of the image
+ * @return 0 if successful, -1 if an error occurred
+ */
+int
+cache_artwork_read(struct evbuffer *evbuf, char *path, int *format)
+{
+  struct cache_command cmd;
+  int ret;
+
+  if (!g_initialized)
+    return -1;
+
+  command_init(&cmd);
+
+  cmd.func = cache_artwork_read_impl;
+  cmd.arg.evbuf = evbuf;
+  cmd.arg.path = path;
+
+  ret = sync_command(&cmd);
+
+  *format = cmd.arg.format;
+
+  command_deinit(&cmd);
+
+  return ret;
+}
 
 
 /* -------------------------- Cache general API --------------------------- */
@@ -1563,22 +1796,22 @@ cache_init(void)
       return 0;
     }
 
-# if defined(__linux__)
+#ifdef HAVE_PIPE2
   ret = pipe2(g_exit_pipe, O_CLOEXEC);
-# else
+#else
   ret = pipe(g_exit_pipe);
-# endif
+#endif
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_CACHE, "Could not create pipe: %s\n", strerror(errno));
+      DPRINTF(E_LOG, L_CACHE, "Could not create exit pipe: %s\n", strerror(errno));
       goto exit_fail;
     }
 
-# if defined(__linux__)
+#ifdef HAVE_PIPE2
   ret = pipe2(g_cmd_pipe, O_CLOEXEC);
-# else
+#else
   ret = pipe(g_cmd_pipe);
-# endif
+#endif
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_CACHE, "Could not create command pipe: %s\n", strerror(errno));
@@ -1592,7 +1825,6 @@ cache_init(void)
       goto evbase_fail;
     }
 
-#ifdef HAVE_LIBEVENT2
   g_exitev = event_new(evbase_cache, g_exit_pipe[0], EV_READ, exit_cb, NULL);
   if (!g_exitev)
     {
@@ -1613,34 +1845,6 @@ cache_init(void)
       DPRINTF(E_LOG, L_CACHE, "Could not create cache event\n");
       goto evnew_fail;
     }
-#else
-  g_exitev = (struct event *)malloc(sizeof(struct event));
-  if (!g_exitev)
-    {
-      DPRINTF(E_LOG, L_CACHE, "Could not create exit event\n");
-      goto evnew_fail;
-    }
-  event_set(g_exitev, g_exit_pipe[0], EV_READ, exit_cb, NULL);
-  event_base_set(evbase_cache, g_exitev);
-
-  g_cmdev = (struct event *)malloc(sizeof(struct event));
-  if (!g_cmdev)
-    {
-      DPRINTF(E_LOG, L_CACHE, "Could not create cmd event\n");
-      goto evnew_fail;
-    }
-  event_set(g_cmdev, g_cmd_pipe[0], EV_READ, command_cb, NULL);
-  event_base_set(evbase_cache, g_cmdev);
-
-  g_cacheev = (struct event *)malloc(sizeof(struct event));
-  if (!g_cacheev)
-    {
-      DPRINTF(E_LOG, L_CACHE, "Could not create cache event\n");
-      goto evnew_fail;
-    }
-  event_set(g_cacheev, -1, EV_TIMEOUT, cache_daap_update_cb, NULL);
-  event_base_set(evbase_cache, g_cacheev);
-#endif
 
   event_add(g_exitev, NULL);
   event_add(g_cmdev, NULL);
@@ -1654,6 +1858,12 @@ cache_init(void)
 
       goto thread_fail;
     }
+
+#if defined(HAVE_PTHREAD_SETNAME_NP)
+  pthread_setname_np(tid_cache, "cache");
+#elif defined(HAVE_PTHREAD_SET_NAME_NP)
+  pthread_set_name_np(tid_cache, "cache");
+#endif
 
   return 0;
   

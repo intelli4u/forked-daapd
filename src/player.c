@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2010-2011 Julien BLACHE <jb@jblache.org>
+ * Copyright (C) 2016 Espen Jürgensen <espenjurgensen@gmail.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -30,39 +31,98 @@
 #include <errno.h>
 #include <time.h>
 #include <pthread.h>
+#ifdef HAVE_PTHREAD_NP_H
+# include <pthread_np.h>
+#endif
 
 #if defined(__linux__)
 # include <sys/timerfd.h>
 #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-# include <sys/time.h>
-# include <sys/event.h>
+# include <signal.h>
 #endif
 
-#if defined(HAVE_SYS_EVENTFD_H) && defined(HAVE_EVENTFD)
-# define USE_EVENTFD
-# include <sys/eventfd.h>
-#endif
-
-#include <event.h>
+#include <event2/event.h>
+#include <event2/buffer.h>
 
 #include <gcrypt.h>
 
 #include "db.h"
-#include "daap_query.h"
 #include "logger.h"
-#include "mdns.h"
 #include "conffile.h"
 #include "misc.h"
-#include "rng.h"
-#include "transcode.h"
 #include "player.h"
-#include "raop.h"
-#include "laudio.h"
+#include "worker.h"
+#include "listener.h"
 
+/* Audio outputs */
+#include "outputs.h"
+
+/* Audio inputs */
+#include "transcode.h"
+#include "pipe.h"
+#ifdef HAVE_SPOTIFY_H
+# include "spotify.h"
+#endif
+
+/* Metadata input/output */
+#include "http.h"
+#ifdef LASTFM
+# include "lastfm.h"
+#endif
 
 #ifndef MIN
 # define MIN(a, b) ((a < b) ? a : b)
 #endif
+
+#ifndef MAX
+#define MAX(a, b) ((a > b) ? a : b)
+#endif
+
+// Default volume (must be from 0 - 100)
+#define PLAYER_DEFAULT_VOLUME 50
+// Used to keep the player from getting ahead of a rate limited source (see below)
+#define PLAYER_TICKS_MAX_OVERRUN 2
+
+struct player_source
+{
+  /* Id of the file/item in the files database */
+  uint32_t id;
+
+  /* Item-Id of the file/item in the queue */
+  uint32_t item_id;
+
+  /* Length of the file/item in milliseconds */
+  uint32_t len_ms;
+
+  enum data_kind data_kind;
+  enum media_kind media_kind;
+
+  /* Start time of the media item as rtp-time
+     The stream-start is the rtp-time the media item did or would have
+     started playing (after seek or pause), therefor the elapsed time of the
+     media item is always:
+     elapsed time = current rtptime - stream-start */
+  uint64_t stream_start;
+
+  /* Output start time of the media item as rtp-time
+     The output start time is the rtp-time of the first audio packet send
+     to the audio outputs.
+     It differs from stream-start especially after a seek, where the first audio
+     packet has the next rtp-time as output start and stream start becomes the
+     rtp-time the media item would have been started playing if the seek did
+     not happen. */
+  uint64_t output_start;
+
+  /* End time of media item as rtp-time
+     The end time is set if the reading (source_read) of the media item reached
+     end of file, until then it is 0. */
+  uint64_t end;
+
+  struct transcode_ctx *xcode;
+  int setup_done;
+
+  struct player_source *play_next;
+};
 
 enum player_sync_source
   {
@@ -84,6 +144,60 @@ struct spk_enum
   void *arg;
 };
 
+struct playback_start_param
+{
+  uint32_t id;
+  int pos;
+
+  uint32_t *id_ptr;
+};
+
+struct playerqueue_get_param
+{
+  int pos;
+  int count;
+
+  struct queue *queue;
+};
+
+struct playerqueue_add_param
+{
+  struct queue_item *items;
+  int pos;
+
+  uint32_t *item_id_ptr;
+};
+
+struct playerqueue_move_param
+{
+  uint32_t item_id;
+  int from_pos;
+  int to_pos;
+  int count;
+};
+
+struct playerqueue_remove_param
+{
+  int from_pos;
+  int count;
+};
+
+struct icy_artwork
+{
+  uint32_t id;
+  char *artwork_url;
+};
+
+struct player_metadata
+{
+  int id;
+  uint64_t rtptime;
+  uint64_t offset;
+  int startup;
+
+  struct output_metadata *omd;
+};
+
 struct player_command
 {
   pthread_mutex_t lck;
@@ -98,78 +212,63 @@ struct player_command
     struct volume_param vol_param;
     void *noarg;
     struct spk_enum *spk_enum;
-    struct raop_device *rd;
+    struct output_device *device;
     struct player_status *status;
     struct player_source *ps;
-    player_status_handler status_handler;
+    struct player_metadata *pmd;
     uint32_t *id_ptr;
-    uint64_t *raop_ids;
+    uint64_t *device_ids;
     enum repeat_mode mode;
     uint32_t id;
     int intval;
+    struct icy_artwork icy;
+    struct playback_start_param playback_start_param;
+    struct playerqueue_get_param queue_get_param;
+    struct playerqueue_add_param queue_add_param;
+    struct playerqueue_move_param queue_move_param;
+    struct playerqueue_remove_param queue_remove_param;
   } arg;
 
   int ret;
 
-  int raop_pending;
+  int output_requests_pending;
 };
-
-struct player_source
-{
-  uint32_t id;
-
-  uint64_t stream_start;
-  uint64_t output_start;
-  uint64_t end;
-
-  struct transcode_ctx *ctx;
-
-  struct player_source *pl_next;
-  struct player_source *pl_prev;
-
-  struct player_source *shuffle_next;
-  struct player_source *shuffle_prev;
-
-  struct player_source *play_next;
-};
-
-
-/* Keep in sync with enum raop_devtype */
-static const char *raop_devtype[] =
-  {
-    "AirPort Express 802.11g",
-    "AirPort Express 802.11n",
-    "AppleTV",
-  };
-
 
 struct event_base *evbase_player;
 
-#ifdef USE_EVENTFD
-static int exit_efd;
-#else
 static int exit_pipe[2];
-#endif
 static int cmd_pipe[2];
 static int player_exit;
-static struct event exitev;
-static struct event cmdev;
+static struct event *exitev;
+static struct event *cmdev;
 static pthread_t tid_player;
+
+/* Config values */
+static int clear_queue_on_stop_disabled;
 
 /* Player status */
 static enum play_status player_state;
 static enum repeat_mode repeat;
 static char shuffle;
 
-/* Status updates (for DACP) */
-static player_status_handler update_handler;
-
 /* Playback timer */
-static int pb_timer_fd;
-static struct event pb_timer_ev;
 #if defined(__linux__)
-static struct timespec pb_timer_last;
+static int pb_timer_fd;
+#else
+timer_t pb_timer;
 #endif
+static struct event *pb_timer_ev;
+static struct timespec pb_timer_last;
+static struct timespec packet_timer_last;
+
+// How often the playback timer triggers player_playback_cb
+static struct timespec tick_interval;
+// Timer resolution
+static struct timespec timer_res;
+// Time between two packets
+static struct timespec packet_time = { 0, AIRTUNES_V2_STREAM_PERIOD };
+// Will be positive if we need to skip some source reads (see below)
+static int ticks_skip;
 
 /* Sync source */
 static enum player_sync_source pb_sync_source;
@@ -181,17 +280,11 @@ static uint64_t pb_pos;
 /* Stream position (packets) */
 static uint64_t last_rtptime;
 
-/* AirTunes devices */
-static int dev_autoselect;
-static struct raop_device *dev_list;
-static uint8_t laudio_enabled;
+/* Output devices */
+static struct output_device *dev_list;
 
-/* Device status */
-static enum laudio_state laudio_status;
-static int laudio_selected;
-static int laudio_volume;
-static int laudio_relvol;
-static int raop_sessions;
+/* Output status */
+static int output_sessions;
 
 /* Commands */
 static struct player_command *cur_cmd;
@@ -199,17 +292,21 @@ static struct player_command *cur_cmd;
 /* Last commanded volume */
 static int master_volume;
 
-/* Shuffle RNG state */
-struct rng_ctx shuffle_rng;
-
 /* Audio source */
-static struct player_source *source_head;
-static struct player_source *shuffle_head;
 static struct player_source *cur_playing;
 static struct player_source *cur_streaming;
 static uint32_t cur_plid;
-static struct evbuffer *audio_buf;
+static uint32_t cur_plversion;
 
+static struct evbuffer *audio_buf;
+static uint8_t rawbuf[STOB(AIRTUNES_V2_PACKET_SAMPLES)];
+
+
+/* Play queue */
+static struct queue *queue;
+
+/* Play history */
+static struct player_history *history;
 
 /* Command helpers */
 static void
@@ -221,7 +318,7 @@ command_async_end(struct player_command *cmd)
   pthread_mutex_unlock(&cmd->lck);
 
   /* Process commands again */
-  event_add(&cmdev, NULL);
+  event_add(cmdev, NULL);
 }
 
 static void
@@ -246,11 +343,7 @@ status_update(enum play_status status)
 {
   player_state = status;
 
-  if (update_handler)
-    update_handler();
-
-  if (status == PLAY_PLAYING)
-    dev_autoselect = 0;
+  listener_notify(LISTENER_PLAYER);
 }
 
 
@@ -285,37 +378,29 @@ vol_to_rel(int volume)
 static void
 volume_master_update(int newvol)
 {
-  struct raop_device *rd;
+  struct output_device *device;
 
   master_volume = newvol;
 
-//  if (laudio_selected)
-  if (laudio_enabled & laudio_selected)
-    laudio_relvol = vol_to_rel(laudio_volume);
-
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd->selected)
-	rd->relvol = vol_to_rel(rd->volume);
+      if (device->selected)
+	device->relvol = vol_to_rel(device->volume);
     }
 }
 
 static void
 volume_master_find(void)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   int newmaster;
 
   newmaster = -1;
 
-//  if (laudio_selected)
-  if (laudio_enabled & laudio_selected)
-    newmaster = laudio_volume;
-
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd->selected && (rd->volume > newmaster))
-	newmaster = rd->volume;
+      if (device->selected && (device->volume > newmaster))
+	newmaster = device->volume;
     }
 
   volume_master_update(newmaster);
@@ -324,60 +409,30 @@ volume_master_find(void)
 
 /* Device select/deselect hooks */
 static void
-speaker_select_laudio(void)
+speaker_select_output(struct output_device *device)
 {
-  laudio_selected = 1;
+  device->selected = 1;
 
-  if (laudio_volume > master_volume)
+  if (device->volume > master_volume)
     {
-      if (player_state == PLAY_STOPPED)
-	volume_master_update(laudio_volume);
+      if (player_state == PLAY_STOPPED || master_volume == -1)
+	volume_master_update(device->volume);
       else
-	laudio_volume = master_volume;
+	device->volume = master_volume;
     }
 
-  laudio_relvol = vol_to_rel(laudio_volume);
+  device->relvol = vol_to_rel(device->volume);
 }
 
 static void
-speaker_select_raop(struct raop_device *rd)
+speaker_deselect_output(struct output_device *device)
 {
-  rd->selected = 1;
+  device->selected = 0;
 
-  if (rd->volume > master_volume)
-    {
-      if (player_state == PLAY_STOPPED)
-	volume_master_update(rd->volume);
-      else
-	rd->volume = master_volume;
-    }
-
-  rd->relvol = vol_to_rel(rd->volume);
-}
-
-static void
-speaker_deselect_laudio(void)
-{
-  laudio_selected = 0;
-
-  if (laudio_volume == master_volume)
+  if (device->volume == master_volume)
     volume_master_find();
 }
 
-static void
-speaker_deselect_raop(struct raop_device *rd)
-{
-  rd->selected = 0;
-
-  if (rd->volume == master_volume)
-    volume_master_find();
-}
-
-int
-player_is_playing(void)
-{
-  return player_state == PLAY_PLAYING ? 1 : 0;
-}
 
 static int
 player_get_current_pos_clock(uint64_t *pos, struct timespec *ts, int commit)
@@ -385,7 +440,7 @@ player_get_current_pos_clock(uint64_t *pos, struct timespec *ts, int commit)
   uint64_t delta;
   int ret;
 
-  ret = clock_gettime(CLOCK_MONOTONIC, ts);
+  ret = clock_gettime_with_res(CLOCK_MONOTONIC, ts, &timer_res);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_PLAYER, "Couldn't get clock: %s\n", strerror(errno));
@@ -422,36 +477,6 @@ player_get_current_pos_clock(uint64_t *pos, struct timespec *ts, int commit)
   return 0;
 }
 
-static int
-player_get_current_pos_laudio(uint64_t *pos, struct timespec *ts, int commit)
-{
-  int ret;
-
-  *pos = laudio_get_pos();
-
-  ret = clock_gettime(CLOCK_MONOTONIC, ts);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Couldn't get clock: %s\n", strerror(errno));
-
-      return -1;
-    }
-
-  if (commit)
-    {
-      pb_pos = *pos;
-
-      pb_pos_stamp.tv_sec = ts->tv_sec;
-      pb_pos_stamp.tv_nsec = ts->tv_nsec;
-
-#ifdef DEBUG_SYNC
-      DPRINTF(E_DBG, L_PLAYER, "Pos: %" PRIu64 " (laudio)\n", *pos);
-#endif
-    }
-
-  return 0;
-}
-
 int
 player_get_current_pos(uint64_t *pos, struct timespec *ts, int commit)
 {
@@ -460,629 +485,835 @@ player_get_current_pos(uint64_t *pos, struct timespec *ts, int commit)
       case PLAYER_SYNC_CLOCK:
 	return player_get_current_pos_clock(pos, ts, commit);
 
-      case PLAYER_SYNC_LAUDIO:
-	return player_get_current_pos_laudio(pos, ts, commit);
+      default:
+	DPRINTF(E_LOG, L_PLAYER, "Bug! player_get_current_pos called with unknown source\n");
     }
 
   return -1;
+}
+
+static int
+pb_timer_start(void)
+{
+  struct itimerspec tick;
+  int ret;
+
+  tick.it_interval = tick_interval;
+  tick.it_value = tick_interval;
+
+#if defined(__linux__)
+  ret = timerfd_settime(pb_timer_fd, 0, &tick, NULL);
+#else
+  ret = timer_settime(pb_timer, 0, &tick, NULL);
+#endif
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not arm playback timer: %s\n", strerror(errno));
+
+      return -1;
+    }
+
+  return 0;
+}
+
+static int
+pb_timer_stop(void)
+{
+  struct itimerspec tick;
+  int ret;
+
+  memset(&tick, 0, sizeof(struct itimerspec));
+
+#if defined(__linux__)
+  ret = timerfd_settime(pb_timer_fd, 0, &tick, NULL);
+#else
+  ret = timer_settime(pb_timer, 0, &tick, NULL);
+#endif
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not disarm playback timer: %s\n", strerror(errno));
+
+      return -1;
+    }
+
+  return 0;
 }
 
 /* Forward */
 static void
 playback_abort(void);
 
+static int
+playerqueue_clear(struct player_command *cmd);
+
 static void
-player_laudio_status_cb(enum laudio_state status)
+player_metadata_send(struct player_metadata *pmd);
+
+/* Callback from the worker thread (async operation as it may block) */
+static void
+playcount_inc_cb(void *arg)
 {
-  struct timespec ts;
-  uint64_t pos;
+  int *id = arg;
 
-  switch (status)
-    {
-      /* Switch sync to clock sync */
-      case LAUDIO_STOPPING:
-	DPRINTF(E_DBG, L_PLAYER, "Local audio stopping\n");
-
-	laudio_status = status;
-
-	/* Synchronize pb_pos and pb_pos_stamp before laudio stops entirely */
-	player_get_current_pos_laudio(&pos, &ts, 1);
-
-	pb_sync_source = PLAYER_SYNC_CLOCK;
-	break;
-
-      /* Switch sync to laudio sync */
-      case LAUDIO_RUNNING:
-	DPRINTF(E_DBG, L_PLAYER, "Local audio running\n");
-
-	laudio_status = status;
-
-	pb_sync_source = PLAYER_SYNC_LAUDIO;
-	break;
-
-      case LAUDIO_FAILED:
-	DPRINTF(E_DBG, L_PLAYER, "Local audio failed\n");
-
-	pb_sync_source = PLAYER_SYNC_CLOCK;
-
-	laudio_close();
-
-	if (raop_sessions == 0)
-	  playback_abort();
-
-	speaker_deselect_laudio();
-	break;
-
-      default:
-      	laudio_status = status;
-	break;
-    }
+  db_file_inc_playcount(*id);
 }
 
+#ifdef LASTFM
+/* Callback from the worker thread (async operation as it may block) */
+static void
+scrobble_cb(void *arg)
+{
+  int *id = arg;
+
+  lastfm_scrobble(*id);
+}
+#endif
+
+/* Callback from the worker thread
+ * This prepares metadata in the worker thread, since especially the artwork
+ * retrieval may take some time. outputs_metadata_prepare() must be thread safe.
+ * The sending must be done in the player thread.
+ */
+static void
+metadata_prepare_cb(void *arg)
+{
+  struct player_metadata *pmd = arg;
+
+  pmd->omd = outputs_metadata_prepare(pmd->id);
+
+  if (pmd->omd)
+    player_metadata_send(pmd);
+
+  outputs_metadata_free(pmd->omd);
+}
+
+/* Callback from the worker thread (async operation as it may block) */
+static void
+update_icy_cb(void *arg)
+{
+  struct http_icy_metadata *metadata = arg;
+
+  db_file_update_icy(metadata->id, metadata->artist, metadata->title);
+
+  http_icy_metadata_free(metadata, 1);
+}
 
 /* Metadata */
 static void
 metadata_prune(uint64_t pos)
 {
-  raop_metadata_prune(pos);
+  outputs_metadata_prune(pos);
 }
 
 static void
 metadata_purge(void)
 {
-  raop_metadata_purge();
+  outputs_metadata_purge();
 }
 
 static void
-metadata_send(struct player_source *ps, int startup)
+metadata_trigger(int startup)
 {
-  uint64_t offset;
-  uint64_t rtptime;
+  struct player_metadata pmd;
 
-  offset = 0;
+  memset(&pmd, 0, sizeof(struct player_metadata));
 
-  /* Determine song boundaries, dependent on context */
+  pmd.id = cur_streaming->id;
+  pmd.startup = startup;
 
-  /* Restart after pause/seek */
-  if (ps->stream_start)
+  if (cur_streaming->stream_start && cur_streaming->output_start)
     {
-      offset = ps->output_start - ps->stream_start;
-      rtptime = ps->stream_start;
-    }
-  else if (startup)
-    {
-      rtptime = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-    }
-  /* Generic case */
-  else if (cur_streaming && (cur_streaming->end))
-    {
-      rtptime = cur_streaming->end + 1;
+      pmd.offset = cur_streaming->output_start - cur_streaming->stream_start;
+      pmd.rtptime = cur_streaming->stream_start;
     }
   else
     {
-      rtptime = 0;
-      DPRINTF(E_LOG, L_PLAYER, "PTOH! Unhandled song boundary case in metadata_send()\n");
+      DPRINTF(E_LOG, L_PLAYER, "PTOH! Unhandled song boundary case in metadata_trigger()\n");
     }
 
-  raop_metadata_send(ps->id, rtptime, offset, startup);
+  /* Defer the actual work of preparing the metadata to the worker thread */
+  worker_execute(metadata_prepare_cb, &pmd, sizeof(struct player_metadata), 0);
+}
+
+/* Checks if there is new HTTP ICY metadata, and if so sends updates to clients */
+void
+metadata_check_icy(void)
+{
+  struct http_icy_metadata *metadata;
+  int changed;
+
+  metadata = transcode_metadata(cur_streaming->xcode, &changed);
+  if (!metadata)
+    return;
+
+  if (!changed || !metadata->title)
+    goto no_update;
+
+  if (metadata->title[0] == '\0')
+    goto no_update;
+
+  metadata->id = cur_streaming->id;
+
+  /* Defer the database update to the worker thread */
+  worker_execute(update_icy_cb, metadata, sizeof(struct http_icy_metadata), 0);
+
+  /* Triggers preparing and sending output metadata */
+  metadata_trigger(0);
+
+  /* Only free the struct, the content must be preserved for update_icy_cb */
+  free(metadata);
+
+  status_update(player_state);
+
+  return;
+
+ no_update:
+  http_icy_metadata_free(metadata, 0);
+}
+
+struct player_history *
+player_history_get(void)
+{
+  return history;
+}
+
+/*
+ * Add the song with the given id to the list of previously played songs
+ */
+static void
+history_add(uint32_t id, uint32_t item_id)
+{
+  unsigned int cur_index;
+  unsigned int next_index;
+
+  /* Check if the current song is already the last in the history to avoid duplicates */
+  cur_index = (history->start_index + history->count - 1) % MAX_HISTORY_COUNT;
+  if (id == history->id[cur_index])
+    {
+      DPRINTF(E_DBG, L_PLAYER, "Current playing/streaming song already in history\n");
+      return;
+    }
+
+  /* Calculate the next index and update the start-index and count for the id-buffer */
+  next_index = (history->start_index + history->count) % MAX_HISTORY_COUNT;
+  if (next_index == history->start_index && history->count > 0)
+    history->start_index = (history->start_index + 1) % MAX_HISTORY_COUNT;
+
+  history->id[next_index] = id;
+  history->item_id[next_index] = item_id;
+
+  if (history->count < MAX_HISTORY_COUNT)
+    history->count++;
 }
 
 
 /* Audio sources */
-/* Thread: httpd (DACP) */
-static struct player_source *
-player_queue_make(struct query_params *qp, const char *sort)
+
+/*
+ * Initializes the given player source for playback
+ */
+static int
+stream_setup(struct player_source *ps, struct media_file_info *mfi)
 {
-  struct db_media_file_info dbmfi;
-  struct player_source *q_head;
-  struct player_source *q_tail;
+  char *url;
+  int ret;
+
+  if (!ps || !mfi)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "No player source and/or media info given to stream_setup\n");
+      return -1;
+    }
+
+  if (ps->setup_done)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Given player source already setup (id = %d)\n", ps->id);
+      return -1;
+    }
+
+  // Setup depending on data kind
+  switch (ps->data_kind)
+    {
+      case DATA_KIND_FILE:
+	ps->xcode = transcode_setup(mfi, XCODE_PCM16_NOHEADER, NULL);
+	ret = ps->xcode ? 0 : -1;
+	break;
+
+      case DATA_KIND_HTTP:
+	ret = http_stream_setup(&url, mfi->path);
+	if (ret < 0)
+	  break;
+
+	free(mfi->path);
+	mfi->path = url;
+
+	ps->xcode = transcode_setup(mfi, XCODE_PCM16_NOHEADER, NULL);
+	ret = ps->xcode ? 0 : -1;
+	break;
+
+      case DATA_KIND_SPOTIFY:
+#ifdef HAVE_SPOTIFY_H
+	ret = spotify_playback_setup(mfi);
+#else
+	DPRINTF(E_LOG, L_PLAYER, "Player source has data kind 'spotify' (%d), but forked-daapd is compiled without spotify support - cannot setup source '%s' (%s)\n",
+		    ps->data_kind, mfi->title, mfi->path);
+	ret = -1;
+#endif
+	break;
+
+      case DATA_KIND_PIPE:
+	ret = pipe_setup(mfi);
+	break;
+
+      default:
+	DPRINTF(E_LOG, L_PLAYER, "Unknown data kind (%d) for player source - cannot setup source '%s' (%s)\n",
+	    ps->data_kind, mfi->title, mfi->path);
+	ret = -1;
+    }
+
+  if (ret == 0)
+      ps->setup_done = 1;
+  else
+      DPRINTF(E_LOG, L_PLAYER, "Failed to setup player source (id = %d)\n", ps->id);
+
+  return ret;
+}
+
+/*
+ * Starts or resumes plaback for the given player source
+ */
+static int
+stream_play(struct player_source *ps)
+{
+  int ret;
+
+  if (!ps)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Stream play called with no active streaming player source\n");
+      return -1;
+    }
+
+  if (!ps->setup_done)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Given player source not setup, play not possible\n");
+      return -1;
+    }
+
+  // Start/resume playback depending on data kind
+  switch (ps->data_kind)
+    {
+      case DATA_KIND_HTTP:
+      case DATA_KIND_FILE:
+	ret = 0;
+	break;
+
+#ifdef HAVE_SPOTIFY_H
+      case DATA_KIND_SPOTIFY:
+	ret = spotify_playback_play();
+	break;
+#endif
+
+      case DATA_KIND_PIPE:
+	ret = 0;
+	break;
+
+      default:
+	ret = -1;
+    }
+
+  return ret;
+}
+
+/*
+ * Read up to "len" data from the given player source and returns
+ * the actual amount of data read.
+ */
+static int
+stream_read(struct player_source *ps, int len)
+{
+  int icy_timer;
+  int ret;
+
+  if (!ps)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Stream read called with no active streaming player source\n");
+      return -1;
+    }
+
+  if (!ps->setup_done)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Given player source not setup for reading data\n");
+      return -1;
+    }
+
+  // Read up to len data depending on data kind
+  switch (ps->data_kind)
+    {
+      case DATA_KIND_HTTP:
+	ret = transcode(audio_buf, len, ps->xcode, &icy_timer);
+
+	if (icy_timer)
+	  metadata_check_icy();
+	break;
+
+      case DATA_KIND_FILE:
+	ret = transcode(audio_buf, len, ps->xcode, &icy_timer);
+	break;
+
+#ifdef HAVE_SPOTIFY_H
+      case DATA_KIND_SPOTIFY:
+	ret = spotify_audio_get(audio_buf, len);
+	break;
+#endif
+
+      case DATA_KIND_PIPE:
+	ret = pipe_audio_get(audio_buf, len);
+	break;
+
+      default:
+	ret = -1;
+    }
+
+  return ret;
+}
+
+/*
+ * Pauses playback of the given player source
+ */
+static int
+stream_pause(struct player_source *ps)
+{
+  int ret;
+
+  if (!ps)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Stream pause called with no active streaming player source\n");
+      return -1;
+    }
+
+  if (!ps->setup_done)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Given player source not setup, pause not possible\n");
+      return -1;
+    }
+
+  // Pause playback depending on data kind
+  switch (ps->data_kind)
+    {
+      case DATA_KIND_HTTP:
+	ret = 0;
+	break;
+
+      case DATA_KIND_FILE:
+	ret = 0;
+	break;
+
+#ifdef HAVE_SPOTIFY_H
+      case DATA_KIND_SPOTIFY:
+	ret = spotify_playback_pause();
+	break;
+#endif
+
+      case DATA_KIND_PIPE:
+	ret = 0;
+	break;
+
+      default:
+	ret = -1;
+    }
+
+  return ret;
+}
+
+/*
+ * Seeks to the given position in milliseconds of the given player source
+ */
+static int
+stream_seek(struct player_source *ps, int seek_ms)
+{
+  int ret;
+
+  if (!ps)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Stream seek called with no active streaming player source\n");
+      return -1;
+    }
+
+  if (!ps->setup_done)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Given player source not setup, seek not possible\n");
+      return -1;
+    }
+
+  // Seek depending on data kind
+  switch (ps->data_kind)
+    {
+      case DATA_KIND_HTTP:
+	ret = 0;
+	break;
+
+      case DATA_KIND_FILE:
+	ret = transcode_seek(ps->xcode, seek_ms);
+	break;
+
+#ifdef HAVE_SPOTIFY_H
+      case DATA_KIND_SPOTIFY:
+	ret = spotify_playback_seek(seek_ms);
+	break;
+#endif
+
+      case DATA_KIND_PIPE:
+	ret = 0;
+	break;
+
+      default:
+	ret = -1;
+    }
+
+  return ret;
+}
+
+/*
+ * Stops playback and cleanup for the given player source
+ */
+static int
+stream_stop(struct player_source *ps)
+{
+  if (!ps)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Stream cleanup called with no active streaming player source\n");
+      return -1;
+    }
+
+  if (!ps->setup_done)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Given player source not setup, cleanup not possible\n");
+      return -1;
+    }
+
+  switch (ps->data_kind)
+    {
+      case DATA_KIND_FILE:
+      case DATA_KIND_HTTP:
+	if (ps->xcode)
+	  {
+	    transcode_cleanup(ps->xcode);
+	    ps->xcode = NULL;
+	  }
+	break;
+
+      case DATA_KIND_SPOTIFY:
+#ifdef HAVE_SPOTIFY_H
+	spotify_playback_stop();
+#endif
+	break;
+
+      case DATA_KIND_PIPE:
+	pipe_cleanup();
+	break;
+    }
+
+  ps->setup_done = 0;
+
+  return 0;
+}
+
+
+static struct player_source *
+source_now_playing()
+{
+  if (cur_playing)
+    return cur_playing;
+
+  return cur_streaming;
+}
+
+/*
+ * Creates a new player source for the given queue item
+ */
+static struct player_source *
+source_new(struct queue_item *item)
+{
   struct player_source *ps;
+
+  ps = (struct player_source *)calloc(1, sizeof(struct player_source));
+
+  ps->id = queueitem_id(item);
+  ps->item_id = queueitem_item_id(item);
+  ps->data_kind = queueitem_data_kind(item);
+  ps->media_kind = queueitem_media_kind(item);
+  ps->len_ms = queueitem_len(item);
+  ps->play_next = NULL;
+
+  return ps;
+}
+
+/*
+ * Stops playback for the current streaming source and frees all
+ * player sources (starting from the playing source). Sets current streaming
+ * and playing sources to NULL.
+ */
+static void
+source_stop()
+{
+  struct player_source *ps_playing;
+  struct player_source *ps_temp;
+
+  if (cur_streaming)
+    stream_stop(cur_streaming);
+
+  ps_playing = source_now_playing();
+
+  while (ps_playing)
+    {
+      ps_temp = ps_playing;
+      ps_playing = ps_playing->play_next;
+
+      ps_temp->play_next = NULL;
+      free(ps_temp);
+    }
+
+  cur_playing = NULL;
+  cur_streaming = NULL;
+}
+
+/*
+ * Pauses playback
+ *
+ * Resets the streaming source to the playing source and adjusts stream-start
+ * and output-start values to the playing time. Sets the current streaming
+ * source to NULL.
+ */
+static int
+source_pause(uint64_t pos)
+{
+  struct player_source *ps_playing;
+  struct player_source *ps_playnext;
+  struct player_source *ps_temp;
+  struct media_file_info *mfi;
+  uint64_t seek_frames;
+  int seek_ms;
+  int ret;
+
+  ps_playing = source_now_playing();
+
+  if (cur_streaming)
+    {
+      if (ps_playing != cur_streaming)
+	{
+	  DPRINTF(E_DBG, L_PLAYER,
+	      "Pause called on playing source (id=%d) and streaming source already "
+	      "switched to the next item (id=%d)\n", ps_playing->id, cur_streaming->id);
+	  ret = stream_stop(cur_streaming);
+	  if (ret < 0)
+	    return -1;
+	}
+      else
+	{
+	  ret = stream_pause(cur_streaming);
+	  if (ret < 0)
+	    return -1;
+	}
+    }
+
+  ps_playnext = ps_playing->play_next;
+  while (ps_playnext)
+    {
+      ps_temp = ps_playnext;
+      ps_playnext = ps_playnext->play_next;
+
+      ps_temp->play_next = NULL;
+      free(ps_temp);
+    }
+  ps_playing->play_next = NULL;
+
+  cur_playing = NULL;
+  cur_streaming = ps_playing;
+
+  if (!cur_streaming->setup_done)
+    {
+      mfi = db_file_fetch_byid(cur_streaming->id);
+      if (!mfi)
+	{
+	  DPRINTF(E_LOG, L_PLAYER, "Couldn't fetch file id %d\n", cur_streaming->id);
+
+	  return -1;
+	}
+
+      if (mfi->disabled)
+	{
+	  DPRINTF(E_DBG, L_PLAYER, "File id %d is disabled, skipping\n", cur_streaming->id);
+
+	  free_mfi(mfi, 0);
+	  return -1;
+	}
+
+      DPRINTF(E_INFO, L_PLAYER, "Opening '%s' (%s)\n", mfi->title, mfi->path);
+
+      ret = stream_setup(cur_streaming, mfi);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_PLAYER, "Failed to open '%s' (%s)\n", mfi->title, mfi->path);
+	  free_mfi(mfi, 0);
+	  return -1;
+	}
+
+      free_mfi(mfi, 0);
+    }
+
+  /* Seek back to the pause position */
+  seek_frames = (pos - cur_streaming->stream_start);
+  seek_ms = (int)((seek_frames * 1000) / 44100);
+  ret = stream_seek(cur_streaming, seek_ms);
+
+  /* Adjust start_pos to take into account the pause and seek back */
+  cur_streaming->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES - ((uint64_t)ret * 44100) / 1000;
+  cur_streaming->output_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
+  cur_streaming->end = 0;
+
+  return 0;
+}
+
+/*
+ * Seeks the current streaming source to the given postion in milliseconds
+ * and adjusts stream-start and output-start values.
+ *
+ * @param seek_ms Position in milliseconds to seek
+ * @return The new position in milliseconds or -1 on error
+ */
+static int
+source_seek(int seek_ms)
+{
+  int ret;
+
+  ret = stream_seek(cur_streaming, seek_ms);
+  if (ret < 0)
+    return -1;
+
+  /* Adjust start_pos to take into account the pause and seek back */
+  cur_streaming->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES - ((uint64_t)ret * 44100) / 1000;
+  cur_streaming->output_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
+
+  return ret;
+}
+
+/*
+ * Starts or resumes playback
+ */
+static int
+source_play()
+{
+  int ret;
+
+  ret = stream_play(cur_streaming);
+
+  ticks_skip = 0;
+  memset(rawbuf, 0, sizeof(rawbuf));
+
+  return ret;
+}
+
+/*
+ * Initializes playback of the given queue item (but does not start playback)
+ *
+ * A new source is created for the given queue item and is set as the current
+ * streaming source. If a streaming source already existed (and reached eof)
+ * the new source is appended as the play-next item to it.
+ *
+ * Stream-start and output-start values are set to the given start position.
+ */
+static int
+source_open(struct queue_item *qii, uint64_t start_pos, int seek)
+{
+  struct player_source *ps;
+  struct media_file_info *mfi;
   uint32_t id;
   int ret;
 
-  qp->idx_type = I_NONE;
-  qp->sort = S_NONE;
-
-  if (sort)
+  if (cur_streaming && cur_streaming->end == 0)
     {
-      if (strcmp(sort, "name") == 0)
-	qp->sort = S_NAME;
-      else if (strcmp(sort, "album") == 0)
-	qp->sort = S_ALBUM;
-      else if (strcmp(sort, "artist") == 0)
-	qp->sort = S_ARTIST;
+      DPRINTF(E_LOG, L_PLAYER, "Current streaming source not at eof %d\n", cur_streaming->id);
+      return -1;
     }
 
-  ret = db_query_start(qp);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not start query\n");
-
-      return NULL;
-    }
-
-  DPRINTF(E_DBG, L_PLAYER, "Player queue query returned %d items\n", qp->results);
-
-  q_head = NULL;
-  q_tail = NULL;
-  while (((ret = db_query_fetch_file(qp, &dbmfi)) == 0) && (dbmfi.id))
-    {
-      ret = safe_atou32(dbmfi.id, &id);
-      if (ret < 0)
-	{
-	  DPRINTF(E_LOG, L_PLAYER, "Invalid song id in query result!\n");
-
-	  continue;
-	}
-
-      ps = (struct player_source *)malloc(sizeof(struct player_source));
-      if (!ps)
-	{
-	  DPRINTF(E_LOG, L_PLAYER, "Out of memory for struct player_source\n");
-
-	  ret = -1;
-	  break;
-	}
-
-      memset(ps, 0, sizeof(struct player_source));
-
-      ps->id = id;
-
-      if (!q_head)
-	q_head = ps;
-
-      if (q_tail)
-	{
-	  q_tail->pl_next = ps;
-	  ps->pl_prev = q_tail;
-
-	  q_tail->shuffle_next = ps;
-	  ps->shuffle_prev = q_tail;
-	}
-
-      q_tail = ps;
-
-      DPRINTF(E_DBG, L_PLAYER, "Added song id %d (%s)\n", id, dbmfi.title);
-    }
-
-  db_query_end(qp);
-
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Error fetching results\n");
-
-      return NULL;
-    }
-
-  if (!q_head)
-    return NULL;
-
-  q_head->pl_prev = q_tail;
-  q_tail->pl_next = q_head;
-
-  return q_head;
-}
-
-/* Thread: httpd (DACP) */
-struct player_source *
-player_queue_make_daap(const char *query, const char *sort)
-{
-  struct query_params qp;
-  struct player_source *ps;
-
-  memset(&qp, 0, sizeof(struct query_params));
-
-  qp.type = Q_ITEMS;
-  qp.offset = 0;
-  qp.limit = 0;
-
-  qp.filter = daap_query_parse_sql(query);
-  if (!qp.filter)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Improper DAAP query!\n");
-
-      return NULL;
-    }
-
-  ps = player_queue_make(&qp, sort);
-
-  free(qp.filter);
-
-  return ps;
-}
-
-struct player_source *
-player_queue_make_pl(int plid, uint32_t *id)
-{
-  struct query_params qp;
-  struct player_source *ps;
-  struct player_source *p;
-  uint32_t i;
-
-  memset(&qp, 0, sizeof(struct query_params));
-
-  qp.id = plid;
-  qp.type = Q_PLITEMS;
-  qp.offset = 0;
-  qp.limit = 0;
-
-  ps = player_queue_make(&qp, NULL);
-
-  /* Shortcut for shuffled playlist */
-  if (*id == 0)
-    return ps;
-
-  p = ps;
-  i = 0;
-  do
-    {
-      if (p->id == *id)
-	{
-	  *id = i;
-	  break;
-	}
-
-      p = p->pl_next;
-      i++;
-    }
-  while (p != ps);
-
-  return ps;
-}
-
-static void
-source_free(struct player_source *ps)
-{
-  if (ps->ctx)
-    transcode_cleanup(ps->ctx);
-
-  free(ps);
-}
-
-static void
-source_stop(struct player_source *ps)
-{
-  struct player_source *tmp;
-
-  while (ps)
-    {
-      if (ps->ctx)
-	{
-	  transcode_cleanup(ps->ctx);
-	  ps->ctx = NULL;
-	}
-
-      tmp = ps;
-      ps = ps->play_next;
-
-      tmp->play_next = NULL;
-    }
-}
-
-static struct player_source *
-source_shuffle(struct player_source *head)
-{
-  struct player_source *ps;
-  struct player_source **ps_array;
-  int nitems;
-  int i;
-
-  if (!head)
-    return NULL;
-
-  ps = head;
-  nitems = 0;
-  do
-    {
-      nitems++;
-      ps = ps->pl_next;
-    }
-  while (ps != head);
-
-  ps_array = (struct player_source **)malloc(nitems * sizeof(struct player_source *));
-  if (!ps_array)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not allocate memory for shuffle array\n");
-      return NULL;
-    }
-
-  ps = head;
-  i = 0;
-  do
-    {
-      ps_array[i] = ps;
-
-      ps = ps->pl_next;
-      i++;
-    }
-  while (ps != head);
-
-  shuffle_ptr(&shuffle_rng, (void **)ps_array, nitems);
-
-  for (i = 0; i < nitems; i++)
-    {
-      ps = ps_array[i];
-
-      if (i > 0)
-	ps->shuffle_prev = ps_array[i - 1];
-
-      if (i < (nitems - 1))
-	ps->shuffle_next = ps_array[i + 1];
-    }
-
-  ps_array[0]->shuffle_prev = ps_array[nitems - 1];
-  ps_array[nitems - 1]->shuffle_next = ps_array[0];
-
-  ps = ps_array[0];
-
-  free(ps_array);
-
-  return ps;
-}
-
-static void
-source_reshuffle(void)
-{
-  struct player_source *ps;
-
-  ps = source_shuffle(source_head);
-  if (!ps)
-    return;
-
-  if (cur_streaming)
-    shuffle_head = cur_streaming;
-  else
-    shuffle_head = ps;
-}
-
-/* Helper */
-static int
-source_open(struct player_source *ps, int no_md)
-{
-  struct media_file_info *mfi;
-
-  ps->stream_start = 0;
-  ps->output_start = 0;
-  ps->end = 0;
-  ps->play_next = NULL;
-
-  mfi = db_file_fetch_byid(ps->id);
+  id = queueitem_id(qii);
+  mfi = db_file_fetch_byid(id);
   if (!mfi)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Couldn't fetch file id %d\n", ps->id);
+      DPRINTF(E_LOG, L_PLAYER, "Couldn't fetch file id %d\n", id);
 
       return -1;
     }
 
   if (mfi->disabled)
     {
-      DPRINTF(E_DBG, L_PLAYER, "File id %d is disabled, skipping\n", ps->id);
+      DPRINTF(E_DBG, L_PLAYER, "File id %d is disabled, skipping\n", id);
 
       free_mfi(mfi, 0);
       return -1;
     }
 
-  DPRINTF(E_DBG, L_PLAYER, "Opening %s\n", mfi->path);
+  DPRINTF(E_INFO, L_PLAYER, "Opening '%s' (%s)\n", mfi->title, mfi->path);
 
-  ps->ctx = transcode_setup(mfi, NULL, 0);
+  ps = source_new(qii);
+
+  ret = stream_setup(ps, mfi);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Failed to open '%s' (%s)\n", mfi->title, mfi->path);
+      free_mfi(mfi, 0);
+      return -1;
+    }
+
+  /* If a streaming source exists, append the new source as play-next and set it
+     as the new streaming source */
+  if (cur_streaming)
+    {
+      cur_streaming->play_next = ps;
+    }
+
+  cur_streaming = ps;
+
+  cur_streaming->stream_start = start_pos;
+  cur_streaming->output_start = cur_streaming->stream_start;
+  cur_streaming->end = 0;
+
+  /* Seek to the saved seek position */
+  if (seek && mfi->seek)
+    source_seek(mfi->seek);
 
   free_mfi(mfi, 0);
-
-  if (!ps->ctx)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not open file id %d\n", ps->id);
-
-      return -1;
-    }
-
-  if (!no_md)
-    metadata_send(ps, (player_state == PLAY_PLAYING) ? 0 : 1);
-
-  return 0;
-}
-
-static int
-source_next(int force)
-{
-  struct player_source *ps;
-  struct player_source *head;
-  struct player_source *limit;
-  enum repeat_mode r_mode;
-  int ret;
-
-  head = (shuffle) ? shuffle_head : source_head;
-  limit = head;
-  r_mode = repeat;
-
-  /* Force repeat mode at user request */
-  if (force && (r_mode == REPEAT_SONG))
-    r_mode = REPEAT_ALL;
-
-  /* Playlist has only one file, treat REPEAT_ALL as REPEAT_SONG */
-  if ((r_mode == REPEAT_ALL) && (source_head == source_head->pl_next))
-    r_mode = REPEAT_SONG;
-  /* Playlist has only one file, not a user action, treat as REPEAT_ALL
-   * and source_check() will stop playback
-   */
-  else if (!force && (r_mode == REPEAT_OFF) && (source_head == source_head->pl_next))
-    r_mode = REPEAT_SONG;
-
-  if (!cur_streaming)
-    ps = head;
-  else
-    ps = (shuffle) ? cur_streaming->shuffle_next : cur_streaming->pl_next;
-
-  switch (r_mode)
-    {
-      case REPEAT_SONG:
-	if (cur_streaming->ctx)
-	  {
-	    ret = transcode_seek(cur_streaming->ctx, 0);
-
-	    /* source_open() takes care of sending metadata, but we don't
-	     * call it when repeating a song as we just seek back to 0
-	     * so we have to handle metadata ourselves here
-	     */
-	    if (ret >= 0)
-	      metadata_send(cur_streaming, 0);
-	  }
-	else
-	  ret = source_open(cur_streaming, force);
-
-	if (ret < 0)
-	  {
-	    DPRINTF(E_LOG, L_PLAYER, "Failed to restart song for song repeat\n");
-
-	    return -1;
-	  }
-
-	return 0;
-
-      case REPEAT_ALL:
-	if (!shuffle)
-	  {
-	    limit = ps;
-	    break;
-	  }
-
-	/* Reshuffle before repeating playlist */
-	if (cur_streaming && (ps == shuffle_head))
-	  {
-	    source_reshuffle();
-	    ps = shuffle_head;
-	  }
-
-	limit = shuffle_head;
-
-	break;
-
-      case REPEAT_OFF:
-	limit = head;
-
-	if (force && (ps == limit))
-	  {
-	    DPRINTF(E_DBG, L_PLAYER, "End of playlist reached and repeat is OFF\n");
-
-	    playback_abort();
-	    return 0;
-	  }
-	break;
-    }
-
-  do
-    {
-      ret = source_open(ps, force);
-      if (ret < 0)
-	{
-	  if (shuffle)
-	    ps = ps->shuffle_next;
-	  else
-	    ps = ps->pl_next;
-
-	  continue;
-	}
-
-      break;
-    }
-  while (ps != limit);
-
-  /* Couldn't open any of the files in our queue */
-  if (ret < 0)
-    {
-      DPRINTF(E_WARN, L_PLAYER, "Could not open any file in the queue (next)\n");
-
-      return -1;
-    }
-
-  if (!force && cur_streaming)
-    cur_streaming->play_next = ps;
-
-  cur_streaming = ps;
-
-  return 0;
-}
-
-static int
-source_prev(void)
-{
-  struct player_source *ps;
-  struct player_source *head;
-  struct player_source *limit;
-  int ret;
-
-  if (!cur_streaming)
-    return -1;
-
-  head = (shuffle) ? shuffle_head : source_head;
-  ps = (shuffle) ? cur_streaming->shuffle_prev : cur_streaming->pl_prev;
-  limit = ps;
-
-  if ((repeat == REPEAT_OFF) && (cur_streaming == head))
-    {
-      DPRINTF(E_DBG, L_PLAYER, "Start of playlist reached and repeat is OFF\n");
-
-      playback_abort();
-      return 0;
-    }
-
-  /* We are not reshuffling on prev calls in the shuffle case - should we? */
-
-  do
-    {
-      ret = source_open(ps, 1);
-      if (ret < 0)
-	{
-	  if (shuffle)
-	    ps = ps->shuffle_prev;
-	  else
-	    ps = ps->pl_prev;
-
-	  continue;
-	}
-
-      break;
-    }
-  while (ps != limit);
-
-  /* Couldn't open any of the files in our queue */
-  if (ret < 0)
-    {
-      DPRINTF(E_WARN, L_PLAYER, "Could not open any file in the queue (prev)\n");
-
-      return -1;
-    }
-
-  cur_streaming = ps;
-
-  return 0;
-}
-
-static int
-source_position(struct player_source *ps)
-{
-  struct player_source *p;
-  int ret;
-
-  ret = 0;
-  for (p = source_head; p != ps; p = p->pl_next)
-    ret++;
-
   return ret;
 }
 
+/*
+ * Closes the current streaming source and sets its end-time to the given
+ * position
+ */
+static int
+source_close(uint64_t end_pos)
+{
+  stream_stop(cur_streaming);
+
+  cur_streaming->end = end_pos;
+
+  return 0;
+}
+
+/*
+ * Updates the now playing item (cur_playing) and notifies remotes and raop devices
+ * about changes. Also takes care of stopping playback after the last item.
+ *
+ * @return Returns the current playback position as rtp-time
+ */
 static uint64_t
 source_check(void)
 {
   struct timespec ts;
   struct player_source *ps;
-  struct player_source *head;
   uint64_t pos;
-  enum repeat_mode r_mode;
   int i;
+  int id;
   int ret;
-
-  if (!cur_streaming)
-    return 0;
 
   ret = player_get_current_pos(&pos, &ts, 0);
   if (ret < 0)
@@ -1092,6 +1323,14 @@ source_check(void)
       return 0;
     }
 
+  if (player_state == PLAY_STOPPED)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Bug! source_check called but playback has already stopped\n");
+
+      return pos;
+    }
+
+  /* If cur_playing is NULL, we are still in the first two seconds after starting the stream */
   if (!cur_playing)
     {
       if (pos >= cur_streaming->output_start)
@@ -1105,59 +1344,27 @@ source_check(void)
       return pos;
     }
 
+  /* Check if we are still in the middle of the current playing song */
   if ((cur_playing->end == 0) || (pos < cur_playing->end))
     return pos;
 
-  r_mode = repeat;
-  /* Playlist has only one file, treat REPEAT_ALL as REPEAT_SONG */
-  if ((r_mode == REPEAT_ALL) && (source_head == source_head->pl_next))
-    r_mode = REPEAT_SONG;
-
-  if (r_mode == REPEAT_SONG)
-    {
-      ps = cur_playing;
-
-      /* Check that we haven't gone to the next file already
-       * (repeat song toggled in the last 2 seconds of a song)
-       */
-      if (cur_playing->play_next)
-	{
-	  cur_playing = cur_playing->play_next;
-
-	  if (ps->ctx)
-	    {
-	      transcode_cleanup(ps->ctx);
-	      ps->ctx = NULL;
-	      ps->play_next = NULL;
-	    }
-        }
-
-      cur_playing->stream_start = ps->end + 1;
-      cur_playing->output_start = cur_playing->stream_start;
-
-      /* Do not use cur_playing to reset the end position, it may have changed */
-      ps->end = 0;
-
-      status_update(PLAY_PLAYING);
-
-      metadata_prune(pos);
-
-      return pos;
-    }
-
-  head = (shuffle) ? shuffle_head : source_head;
+  /* We have reached the end of the current playing song, update cur_playing to the next song in the queue
+     and initialize stream_start and output_start values. */
 
   i = 0;
   while (cur_playing && (cur_playing->end != 0) && (pos > cur_playing->end))
     {
       i++;
 
-      /* Stop playback if:
-       * - at end of playlist (NULL)
-       * - repeat OFF and at end of playlist (wraparound)
-       */
-      if (!cur_playing->play_next
-	  || ((r_mode == REPEAT_OFF) && (cur_playing->play_next == head)))
+      id = (int)cur_playing->id;
+      worker_execute(playcount_inc_cb, &id, sizeof(int), 5);
+#ifdef LASTFM
+      worker_execute(scrobble_cb, &id, sizeof(int), 8);
+#endif
+      history_add(cur_playing->id, cur_playing->item_id);
+
+      /* Stop playback */
+      if (!cur_playing->play_next)
 	{
 	  playback_abort();
 
@@ -1167,15 +1374,7 @@ source_check(void)
       ps = cur_playing;
       cur_playing = cur_playing->play_next;
 
-      cur_playing->stream_start = ps->end + 1;
-      cur_playing->output_start = cur_playing->stream_start;
-
-      if (ps->ctx)
-	{
-	  transcode_cleanup(ps->ctx);
-	  ps->ctx = NULL;
-	  ps->play_next = NULL;
-	}
+      free(ps);
     }
 
   if (i > 0)
@@ -1193,37 +1392,69 @@ source_check(void)
 static int
 source_read(uint8_t *buf, int len, uint64_t rtptime)
 {
-  int new;
   int ret;
   int nbytes;
+  char *silence_buf;
+  struct queue_item *item;
 
   if (!cur_streaming)
     return 0;
 
   nbytes = 0;
-  new = 0;
   while (nbytes < len)
     {
-      if (new)
+      if (evbuffer_get_length(audio_buf) == 0)
 	{
-	  DPRINTF(E_DBG, L_PLAYER, "New file\n");
+	  if (cur_streaming)
+	    {
+	      ret = stream_read(cur_streaming, len - nbytes);
+	    }
+	  else if (cur_playing)
+	    {
+	      // Reached end of playlist (cur_playing is NULL) send silence and source_check will abort playback if the last item was played
+	      DPRINTF(E_SPAM, L_PLAYER, "End of playlist reached, stream silence until playback of last item ends\n");
+	      silence_buf = (char *)calloc((len - nbytes), sizeof(char));
+	      evbuffer_add(audio_buf, silence_buf, (len - nbytes));
+	      free(silence_buf);
+	      ret = len - nbytes;
+	    }
+	  else
+	    {
+	      // If cur_streaming and cur_playing are NULL, source_read for all queue items failed. Playback will be aborted in the calling function
+	      return -1;
+	    }
 
-	  new = 0;
-
-	  ret = source_next(0);
-	  if (ret < 0)
-	    return -1;
-	}
-
-      if (EVBUFFER_LENGTH(audio_buf) == 0)
-	{
-	  ret = transcode(cur_streaming->ctx, audio_buf, len - nbytes);
 	  if (ret <= 0)
 	    {
 	      /* EOF or error */
-	      cur_streaming->end = rtptime + BTOS(nbytes) - 1;
+	      source_close(rtptime + BTOS(nbytes) - 1);
 
-	      new = 1;
+	      DPRINTF(E_DBG, L_PLAYER, "New file\n");
+
+	      item = queue_next(queue, cur_streaming->item_id, shuffle, repeat, 1);
+
+	      if (ret < 0)
+		{
+		  DPRINTF(E_LOG, L_PLAYER, "Error reading source %d\n", cur_streaming->id);
+		  queue_remove_byitemid(queue, cur_streaming->item_id);
+		}
+
+	      if (item)
+		{
+		  ret = source_open(item, cur_streaming->end + 1, 0);
+		  if (ret < 0)
+		    return -1;
+
+		  ret = source_play();
+		  if (ret < 0)
+		    return -1;
+
+		  metadata_trigger(0);
+		}
+	      else
+		{
+		  cur_streaming = NULL;
+		}
 	      continue;
 	    }
 	}
@@ -1234,265 +1465,288 @@ source_read(uint8_t *buf, int len, uint64_t rtptime)
   return nbytes;
 }
 
-
 static void
-playback_write(void)
+playback_write(int read_skip)
 {
-  uint8_t rawbuf[AIRTUNES_V2_PACKET_SAMPLES * 2 * 2];
   int ret;
 
   source_check();
+
   /* Make sure playback is still running after source_check() */
   if (player_state == PLAY_STOPPED)
     return;
 
   last_rtptime += AIRTUNES_V2_PACKET_SAMPLES;
 
-  memset(rawbuf, 0, sizeof(rawbuf));
-
-  ret = source_read(rawbuf, sizeof(rawbuf), last_rtptime);
-  if (ret < 0)
+  if (!read_skip)
     {
-      DPRINTF(E_DBG, L_PLAYER, "Error reading from source, aborting playback\n");
+      ret = source_read(rawbuf, sizeof(rawbuf), last_rtptime);
+      if (ret < 0)
+	{
+	  DPRINTF(E_DBG, L_PLAYER, "Error reading from source, aborting playback\n");
 
-      playback_abort();
-      return;
+	  playback_abort();
+	  return;
+	}
     }
+  else
+    DPRINTF(E_SPAM, L_PLAYER, "Skipping read\n");
 
-  if (laudio_enabled & laudio_status & LAUDIO_F_STARTED)
-//  if (laudio_status & LAUDIO_F_STARTED)
-    laudio_write(rawbuf, last_rtptime);
-
-  if (raop_sessions > 0)
-    raop_v2_write(rawbuf, last_rtptime);
+  outputs_write(rawbuf, last_rtptime);
 }
 
-#if defined(__linux__)
 static void
 player_playback_cb(int fd, short what, void *arg)
 {
-  struct itimerspec next;
-  uint64_t ticks;
+  struct timespec next_tick;
+  uint64_t overrun;
   int ret;
+  int skip;
+  int skip_first;
 
-  /* Acknowledge timer */
-  read(fd, &ticks, sizeof(ticks));
+  // Check if we missed any timer expirations
+  overrun = 0;
+#if defined(__linux__)
+  ret = read(fd, &overrun, sizeof(overrun));
+  if (ret <= 0)
+    DPRINTF(E_LOG, L_PLAYER, "Error reading timer\n");
+  else if (overrun > 0)
+    overrun--;
+#else
+  ret = timer_getoverrun(pb_timer);
+  if (ret < 0)
+    DPRINTF(E_LOG, L_PLAYER, "Error getting timer overrun\n");
+  else
+    overrun = ret;
+#endif /* __linux__ */
 
-  playback_write();
+/*debug_counter++;
+if (debug_counter % 2000 == 0)
+{
+  DPRINTF(E_LOG, L_PLAYER, "Sleep a bit!!\n");
+  usleep(5 * AIRTUNES_V2_STREAM_PERIOD / 1000);
+  DPRINTF(E_LOG, L_PLAYER, "Wake again\n");
+}*/
+
+  // The reason we get behind the playback timer may be that we are playing a 
+  // network stream OR that the source is slow to open OR some interruption.
+  // For streams, we might be consuming faster than the stream delivers, so
+  // when ffmpeg's buffer empties (might take a few hours) our av_read_frame()
+  // in transcode.c will begin to block, because ffmpeg has to wait for new data
+  // from the stream server.
+  //
+  // Our strategy to catch up with the timer depends on the source:
+  //   - streams: We will skip reading data every second until we have countered
+  //              the overrun by skipping reads for a number of ticks that is
+  //              3 times the overrun. That should make the source catch up. To
+  //              keep the output happy we resend the previous rawbuf when we
+  //              have skipped a read.
+  //   - files:   Just read and write like crazy until we have caught up.
+
+  skip_first = 0;
+  if (overrun > PLAYER_TICKS_MAX_OVERRUN)
+    {
+      DPRINTF(E_WARN, L_PLAYER, "Behind the playback timer with %" PRIu64 " ticks, initiating catch up\n", overrun);
+
+      if (cur_streaming->data_kind == DATA_KIND_HTTP || cur_streaming->data_kind == DATA_KIND_PIPE)
+	{
+          ticks_skip = 3 * overrun;
+	  // We always skip after a timer overrun, since another read will
+	  // probably just give another time overrun
+	  skip_first = 1;
+	}
+      else
+	ticks_skip = 0;
+    }
+
+  // Decide how many packets to send
+  next_tick = timespec_add(pb_timer_last, tick_interval);
+  for (; overrun > 0; overrun--)
+    next_tick = timespec_add(next_tick, tick_interval);
+
+  do
+    {
+	skip = skip_first || ((ticks_skip > 0) && ((last_rtptime / AIRTUNES_V2_PACKET_SAMPLES) % 126 == 0));
+
+	playback_write(skip);
+
+	skip_first = 0;
+	if (skip)
+	  ticks_skip--;
+
+      packet_timer_last = timespec_add(packet_timer_last, packet_time);
+    }
+  while ((timespec_cmp(packet_timer_last, next_tick) < 0) && (player_state == PLAY_PLAYING));
 
   /* Make sure playback is still running */
   if (player_state == PLAY_STOPPED)
     return;
 
-  pb_timer_last.tv_nsec += AIRTUNES_V2_STREAM_PERIOD;
-  if (pb_timer_last.tv_nsec >= 1000000000)
-    {
-      pb_timer_last.tv_sec++;
-      pb_timer_last.tv_nsec -= 1000000000;
-    }
-
-  next.it_interval.tv_sec = 0;
-  next.it_interval.tv_nsec = 0;
-  next.it_value.tv_sec = pb_timer_last.tv_sec;
-  next.it_value.tv_nsec = pb_timer_last.tv_nsec;
-
-  ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &next, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not set playback timer: %s\n", strerror(errno));
-
-      playback_abort();
-      return;
-    }
-
-  ret = event_add(&pb_timer_ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not re-add playback timer event\n");
-
-      playback_abort();
-      return;
-    }
-}
-#endif /* __linux__ */
-
-
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-static void
-player_playback_cb(int fd, short what, void *arg)
-{
-  struct timespec ts;
-  struct kevent kev;
-  int ret;
-
-  ts.tv_sec = 0;
-  ts.tv_nsec = 0;
-
-  while (kevent(pb_timer_fd, NULL, 0, &kev, 1, &ts) > 0)
-    {
-      if (kev.filter != EVFILT_TIMER)
-        continue;
-
-      playback_write();
-
-      /* Make sure playback is still running */
-      if (player_state == PLAY_STOPPED)
-	return;
-    }
-
-  ret = event_add(&pb_timer_ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not re-add playback timer event\n");
-
-      playback_abort();
-      return;
-    }
-}
-#endif /* __FreeBSD__ || __FreeBSD_kernel__ */
-
-
-static void
-device_free(struct raop_device *dev)
-{
-  free(dev->name);
-
-  if (dev->v4_address)
-    free(dev->v4_address);
-
-  if (dev->v6_address)
-    free(dev->v6_address);
-
-  free(dev);
+  pb_timer_last = next_tick;
 }
 
 /* Helpers */
 static void
-device_remove(struct raop_device *dev)
+device_list_sort(void)
 {
-  struct raop_device *rd;
-  struct raop_device *prev;
+  struct output_device *device;
+  struct output_device *next;
+  struct output_device *prev;
+  int swaps;
+
+  // Swap sorting since even the most inefficient sorting should do fine here
+  do
+    {
+      swaps = 0;
+      prev = NULL;
+      for (device = dev_list; device && device->next; device = device->next)
+	{
+	  next = device->next;
+	  if ( (outputs_priority(device) > outputs_priority(next)) ||
+	       (outputs_priority(device) == outputs_priority(next) && strcasecmp(device->name, next->name) > 0) )
+	    {
+	      if (device == dev_list)
+		dev_list = next;
+	      if (prev)
+		prev->next = next;
+
+	      device->next = next->next;
+	      next->next = device;
+	      swaps++;
+	    }
+	  prev = device;
+	}
+    }
+  while (swaps > 0);
+}
+
+static void
+device_remove(struct output_device *remove)
+{
+  struct output_device *device;
+  struct output_device *prev;
   int ret;
 
   prev = NULL;
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd == dev)
+      if (device == remove)
 	break;
 
-      prev = rd;
+      prev = device;
     }
 
-  if (!rd)
+  if (!device)
     return;
 
-  DPRINTF(E_DBG, L_PLAYER, "Removing AirTunes device %s; stopped advertising\n", dev->name);
+  /* Save device volume */
+  ret = db_speaker_save(remove->id, remove->selected, remove->volume, remove->name);
+  if (ret < 0)
+    DPRINTF(E_LOG, L_PLAYER, "Could not save state for %s device '%s'\n", remove->type_name, remove->name);
+
+  DPRINTF(E_DBG, L_PLAYER, "Removing %s device '%s'; stopped advertising\n", remove->type_name, remove->name);
 
   /* Make sure device isn't selected anymore */
-  if (dev->selected)
-    speaker_deselect_raop(dev);
-
-  /* Save device volume */
-  ret = db_speaker_save(dev->id, 0, dev->volume);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_PLAYER, "Could not save state for speaker %s\n", dev->name);
+  if (remove->selected)
+    speaker_deselect_output(remove);
 
   if (!prev)
-    dev_list = dev->next;
+    dev_list = remove->next;
   else
-    prev->next = dev->next;
+    prev->next = remove->next;
 
-  device_free(dev);
+  outputs_device_free(remove);
 }
 
 static int
-device_check(struct raop_device *dev)
+device_check(struct output_device *check)
 {
-  struct raop_device *rd;
+  struct output_device *device;
 
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd == dev)
+      if (device == check)
 	break;
     }
 
-  return (rd) ? 0 : -1;
+  return (device) ? 0 : -1;
 }
 
 static int
 device_add(struct player_command *cmd)
 {
-  struct raop_device *dev;
-  struct raop_device *rd;
+  struct output_device *add;
+  struct output_device *device;
   int selected;
   int ret;
 
-  dev = cmd->arg.rd;
+  add = cmd->arg.device;
 
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd->id == dev->id)
+      if (device->id == add->id)
 	break;
     }
 
   /* New device */
-  if (!rd)
+  if (!device)
     {
-      rd = dev;
+      device = add;
 
-      ret = db_speaker_get(rd->id, &selected, &rd->volume);
+      ret = db_speaker_get(device->id, &selected, &device->volume);
       if (ret < 0)
 	{
 	  selected = 0;
-	  rd->volume = (master_volume >= 0) ? master_volume : 75;
+	  device->volume = (master_volume >= 0) ? master_volume : PLAYER_DEFAULT_VOLUME;
 	}
 
-//      if (dev_autoselect && selected)
-	speaker_select_raop(rd);
+      if (selected && (player_state != PLAY_PLAYING))
+	speaker_select_output(device);
 
-      rd->next = dev_list;
-      dev_list = rd;
+      device->next = dev_list;
+      dev_list = device;
     }
+  // Update to a device already in the list
   else
     {
-      rd->advertised = 1;
+      device->advertised = 1;
 
-      if (dev->v4_address)
+      if (add->v4_address)
 	{
-	  if (rd->v4_address)
-	    free(rd->v4_address);
+	  if (device->v4_address)
+	    free(device->v4_address);
 
-	  rd->v4_address = dev->v4_address;
-	  rd->v4_port = dev->v4_port;
+	  device->v4_address = add->v4_address;
+	  device->v4_port = add->v4_port;
 
 	  /* Address is ours now */
-	  dev->v4_address = NULL;
+	  add->v4_address = NULL;
 	}
 
-      if (dev->v6_address)
+      if (add->v6_address)
 	{
-	  if (rd->v6_address)
-	    free(rd->v6_address);
+	  if (device->v6_address)
+	    free(device->v6_address);
 
-	  rd->v6_address = dev->v6_address;
-	  rd->v6_port = dev->v6_port;
+	  device->v6_address = add->v6_address;
+	  device->v6_port = add->v6_port;
 
 	  /* Address is ours now */
-	  dev->v6_address = NULL;
+	  add->v6_address = NULL;
 	}
 
-      if (rd->name)
-	free(rd->name);
-      rd->name = dev->name;
-      dev->name = NULL;
+      if (device->name)
+	free(device->name);
+      device->name = add->name;
+      add->name = NULL;
 
-      rd->devtype = dev->devtype;
+      device->has_password = add->has_password;
+      device->password = add->password;
 
-      rd->has_password = dev->has_password;
-      rd->password = dev->password;
-
-      device_free(dev);
+      outputs_device_free(add);
     }
+
+  device_list_sort();
 
   return 0;
 }
@@ -1500,113 +1754,133 @@ device_add(struct player_command *cmd)
 static int
 device_remove_family(struct player_command *cmd)
 {
-  struct raop_device *dev;
-  struct raop_device *rd;
+  struct output_device *remove;
+  struct output_device *device;
 
-  dev = cmd->arg.rd;
+  remove = cmd->arg.device;
 
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd->id == dev->id)
+      if (device->id == remove->id)
         break;
     }
 
-  if (!rd)
+  if (!device)
     {
-      DPRINTF(E_WARN, L_PLAYER, "AirTunes device %s stopped advertising, but not in our list\n", dev->name);
+      DPRINTF(E_WARN, L_PLAYER, "The %s device '%s' stopped advertising, but not in our list\n", remove->type_name, remove->name);
 
-      device_free(dev);
+      outputs_device_free(remove);
       return 0;
     }
 
   /* v{4,6}_port non-zero indicates the address family stopped advertising */
-  if (dev->v4_port && rd->v4_address)
+  if (remove->v4_port && device->v4_address)
     {
-      free(rd->v4_address);
-      rd->v4_address = NULL;
-      rd->v4_port = 0;
+      free(device->v4_address);
+      device->v4_address = NULL;
+      device->v4_port = 0;
     }
 
-  if (dev->v6_port && rd->v6_address)
+  if (remove->v6_port && device->v6_address)
     {
-      free(rd->v6_address);
-      rd->v6_address = NULL;
-      rd->v6_port = 0;
+      free(device->v6_address);
+      device->v6_address = NULL;
+      device->v6_port = 0;
     }
 
-  if (!rd->v4_address && !rd->v6_address)
+  if (!device->v4_address && !device->v6_address)
     {
-      rd->advertised = 0;
+      device->advertised = 0;
 
-      if (!rd->session)
-	device_remove(rd);
+      if (!device->session)
+	device_remove(device);
     }
 
-  device_free(dev);
+  outputs_device_free(remove);
 
   return 0;
 }
 
-/* RAOP callbacks executed in the player thread */
+static int
+metadata_send(struct player_command *cmd)
+{
+  struct player_metadata *pmd;
+
+  pmd = cmd->arg.pmd;
+
+  /* Do the setting of rtptime which was deferred in metadata_trigger because we
+   * wanted to wait until we had the actual last_rtptime
+   */
+  if ((pmd->rtptime == 0) && (pmd->startup))
+    pmd->rtptime = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
+
+  outputs_metadata_send(pmd->omd, pmd->rtptime, pmd->offset, pmd->startup);
+
+  return 0;
+}
+
+/* Output device callbacks executed in the player thread */
 static void
-device_streaming_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_streaming_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
   int ret;
 
-  if (status == RAOP_FAILED)
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_streaming_cb\n", outputs_name(device->type));
+
+  ret = device_check(device);
+  if (ret < 0)
     {
-      raop_sessions--;
+      DPRINTF(E_LOG, L_PLAYER, "Output device disappeared during streaming!\n");
 
-      ret = device_check(dev);
-      if (ret < 0)
-	{
-	  DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during streaming!\n");
+      output_sessions--;
+      return;
+    }
 
-	  return;
-	}
+  if (status == OUTPUT_STATE_FAILED)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' FAILED\n", device->type_name, device->name);
 
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes device %s FAILED\n", dev->name);
+      output_sessions--;
 
       if (player_state == PLAY_PLAYING)
-	speaker_deselect_raop(dev);
+	speaker_deselect_output(device);
 
-      dev->session = NULL;
+      device->session = NULL;
 
-      if (!dev->advertised)
-	device_remove(dev);
+      if (!device->advertised)
+	device_remove(device);
+
+      if (output_sessions == 0)
+	playback_abort();
     }
-  else if (status == RAOP_STOPPED)
+  else if (status == OUTPUT_STATE_STOPPED)
     {
-      raop_sessions--;
+      DPRINTF(E_INFO, L_PLAYER, "The %s device '%s' stopped\n", device->type_name, device->name);
 
-      ret = device_check(dev);
-      if (ret < 0)
-	{
-	  DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during streaming!\n");
+      output_sessions--;
 
-	  return;
-	}
+      device->session = NULL;
 
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes device %s stopped\n", dev->name);
-
-      dev->session = NULL;
-
-      if (!dev->advertised)
-	device_remove(dev);
+      if (!device->advertised)
+	device_remove(device);
     }
+  else
+    outputs_status_cb(session, device_streaming_cb);
 }
 
 static void
-device_command_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_command_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
-  cur_cmd->raop_pending--;
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_command_cb\n", outputs_name(device->type));
 
-  raop_set_status_cb(rs, device_streaming_cb);
+  cur_cmd->output_requests_pending--;
 
-  if (status == RAOP_FAILED)
-    device_streaming_cb(dev, rs, status);
+  outputs_status_cb(session, device_streaming_cb);
 
-  if (cur_cmd->raop_pending == 0)
+  if (status == OUTPUT_STATE_FAILED)
+    device_streaming_cb(device, session, status);
+
+  if (cur_cmd->output_requests_pending == 0)
     {
       if (cur_cmd->func_bh)
 	cur_cmd->ret = cur_cmd->func_bh(cur_cmd);
@@ -1618,32 +1892,34 @@ device_command_cb(struct raop_device *dev, struct raop_session *rs, enum raop_se
 }
 
 static void
-device_shutdown_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_shutdown_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
   int ret;
 
-  cur_cmd->raop_pending--;
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_shutdown_cb\n", outputs_name(device->type));
 
-  if (raop_sessions)
-    raop_sessions--;
+  cur_cmd->output_requests_pending--;
 
-  ret = device_check(dev);
+  if (output_sessions)
+    output_sessions--;
+
+  ret = device_check(device);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared before shutdown completion!\n");
+      DPRINTF(E_WARN, L_PLAYER, "Output device disappeared before shutdown completion!\n");
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
       goto out;
     }
 
-  dev->session = NULL;
+  device->session = NULL;
 
-  if (!dev->advertised)
-    device_remove(dev);
+  if (!device->advertised)
+    device_remove(device);
 
  out:
-  if (cur_cmd->raop_pending == 0)
+  if (cur_cmd->output_requests_pending == 0)
     {
       /* cur_cmd->ret already set
        *  - to 0 (or -2 if password issue) in speaker_set()
@@ -1654,83 +1930,81 @@ device_shutdown_cb(struct raop_device *dev, struct raop_session *rs, enum raop_s
 }
 
 static void
-device_lost_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_lost_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_lost_cb\n", outputs_name(device->type));
+
   /* We lost that device during startup for some reason, not much we can do here */
-  if (status == RAOP_FAILED)
+  if (status == OUTPUT_STATE_FAILED)
     DPRINTF(E_WARN, L_PLAYER, "Failed to stop lost device\n");
   else
     DPRINTF(E_INFO, L_PLAYER, "Lost device stopped properly\n");
 }
 
 static void
-device_activate_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_activate_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
   struct timespec ts;
   int ret;
 
-  cur_cmd->raop_pending--;
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_activate_cb\n", outputs_name(device->type));
 
-  ret = device_check(dev);
+  cur_cmd->output_requests_pending--;
+
+  ret = device_check(device);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during startup!\n");
+      DPRINTF(E_WARN, L_PLAYER, "Output device disappeared during startup!\n");
 
-      raop_set_status_cb(rs, device_lost_cb);
-      raop_device_stop(rs);
+      outputs_status_cb(session, device_lost_cb);
+      outputs_device_stop(session);
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
       goto out;
     }
 
-  if (status == RAOP_PASSWORD)
+  if (status == OUTPUT_STATE_PASSWORD)
     {
-      status = RAOP_FAILED;
+      status = OUTPUT_STATE_FAILED;
       cur_cmd->ret = -2;
     }
 
-  if (status == RAOP_FAILED)
+  if (status == OUTPUT_STATE_FAILED)
     {
-      speaker_deselect_raop(dev);
+      speaker_deselect_output(device);
 
-      if (!dev->advertised)
-	device_remove(dev);
+      if (!device->advertised)
+	device_remove(device);
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
       goto out;
     }
 
-  dev->session = rs;
+  device->session = session;
 
-  raop_sessions++;
+  output_sessions++;
 
-  if ((player_state == PLAY_PLAYING) && (raop_sessions == 1))
+  if ((player_state == PLAY_PLAYING) && (output_sessions == 1))
     {
-      ret = clock_gettime(CLOCK_MONOTONIC, &ts);
+      ret = clock_gettime_with_res(CLOCK_MONOTONIC, &ts, &timer_res);
       if (ret < 0)
 	{
 	  DPRINTF(E_LOG, L_PLAYER, "Could not get current time: %s\n", strerror(errno));
 
-#if defined(__linux__)
 	  /* Fallback to nearest timer expiration time */
 	  ts.tv_sec = pb_timer_last.tv_sec;
 	  ts.tv_nsec = pb_timer_last.tv_nsec;
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-	  if (cur_cmd->ret != -2)
-	    cur_cmd->ret = -1;
-	  goto out;
-#endif
 	}
 
-      raop_playback_start(last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, &ts);
+      outputs_playback_start(last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, &ts);
     }
 
-  raop_set_status_cb(rs, device_streaming_cb);
+  outputs_status_cb(session, device_streaming_cb);
 
  out:
-  if (cur_cmd->raop_pending == 0)
+  if (cur_cmd->output_requests_pending == 0)
     {
       /* cur_cmd->ret already set
        *  - to 0 in speaker_set() (default)
@@ -1742,34 +2016,36 @@ device_activate_cb(struct raop_device *dev, struct raop_session *rs, enum raop_s
 }
 
 static void
-device_probe_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_probe_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
   int ret;
 
-  cur_cmd->raop_pending--;
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_probe_cb\n", outputs_name(device->type));
 
-  ret = device_check(dev);
+  cur_cmd->output_requests_pending--;
+
+  ret = device_check(device);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during probe!\n");
+      DPRINTF(E_WARN, L_PLAYER, "Output device disappeared during probe!\n");
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
       goto out;
     }
 
-  if (status == RAOP_PASSWORD)
+  if (status == OUTPUT_STATE_PASSWORD)
     {
-      status = RAOP_FAILED;
+      status = OUTPUT_STATE_FAILED;
       cur_cmd->ret = -2;
     }
 
-  if (status == RAOP_FAILED)
+  if (status == OUTPUT_STATE_FAILED)
     {
-      speaker_deselect_raop(dev);
+      speaker_deselect_output(device);
 
-      if (!dev->advertised)
-	device_remove(dev);
+      if (!device->advertised)
+	device_remove(device);
 
       if (cur_cmd->ret != -2)
 	cur_cmd->ret = -1;
@@ -1777,7 +2053,7 @@ device_probe_cb(struct raop_device *dev, struct raop_session *rs, enum raop_sess
     }
 
  out:
-  if (cur_cmd->raop_pending == 0)
+  if (cur_cmd->output_requests_pending == 0)
     {
       /* cur_cmd->ret already set
        *  - to 0 in speaker_set() (default)
@@ -1789,40 +2065,42 @@ device_probe_cb(struct raop_device *dev, struct raop_session *rs, enum raop_sess
 }
 
 static void
-device_restart_cb(struct raop_device *dev, struct raop_session *rs, enum raop_session_state status)
+device_restart_cb(struct output_device *device, struct output_session *session, enum output_device_state status)
 {
   int ret;
 
-  cur_cmd->raop_pending--;
+  DPRINTF(E_DBG, L_PLAYER, "Callback from %s to device_restart_cb\n", outputs_name(device->type));
 
-  ret = device_check(dev);
+  cur_cmd->output_requests_pending--;
+
+  ret = device_check(device);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_PLAYER, "AirTunes device disappeared during restart!\n");
+      DPRINTF(E_WARN, L_PLAYER, "Output device disappeared during restart!\n");
 
-      raop_set_status_cb(rs, device_lost_cb);
-      raop_device_stop(rs);
+      outputs_status_cb(session, device_lost_cb);
+      outputs_device_stop(session);
 
       goto out;
     }
 
-  if (status == RAOP_FAILED)
+  if (status == OUTPUT_STATE_FAILED)
     {
-      speaker_deselect_raop(dev);
+      speaker_deselect_output(device);
 
-      if (!dev->advertised)
-	device_remove(dev);
+      if (!device->advertised)
+	device_remove(device);
 
       goto out;
     }
 
-  dev->session = rs;
+  device->session = session;
 
-  raop_sessions++;
-  raop_set_status_cb(rs, device_streaming_cb);
+  output_sessions++;
+  outputs_status_cb(session, device_streaming_cb);
 
  out:
-  if (cur_cmd->raop_pending == 0)
+  if (cur_cmd->output_requests_pending == 0)
     {
       cur_cmd->ret = cur_cmd->func_bh(cur_cmd);
 
@@ -1830,39 +2108,25 @@ device_restart_cb(struct raop_device *dev, struct raop_session *rs, enum raop_se
     }
 }
 
-
 /* Internal abort routine */
 static void
 playback_abort(void)
 {
-  if (laudio_enabled && laudio_status != LAUDIO_CLOSED)
-//  if (laudio_status != LAUDIO_CLOSED)
-    laudio_close();
+  outputs_playback_stop();
 
-  if (raop_sessions > 0)
-    raop_playback_stop();
+  pb_timer_stop();
 
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
+  source_stop();
 
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
+  evbuffer_drain(audio_buf, evbuffer_get_length(audio_buf));
 
-  if (cur_playing)
-    source_stop(cur_playing);
-  else
-    source_stop(cur_streaming);
-
-  cur_playing = NULL;
-  cur_streaming = NULL;
-
-  evbuffer_drain(audio_buf, EVBUFFER_LENGTH(audio_buf));
+  if (!clear_queue_on_stop_disabled)
+    playerqueue_clear(NULL);
 
   status_update(PLAY_STOPPED);
 
   metadata_purge();
 }
-
 
 /* Actual commands, executed in the player thread */
 static int
@@ -1871,22 +2135,22 @@ get_status(struct player_command *cmd)
   struct timespec ts;
   struct player_source *ps;
   struct player_status *status;
+  struct queue_item *item_next;
   uint64_t pos;
   int ret;
 
   status = cmd->arg.status;
 
+  memset(status, 0, sizeof(struct player_status));
+
   status->shuffle = shuffle;
   status->repeat = repeat;
-
-  /* No devices selected, autoselect local audio */
-  if (laudio_enabled && master_volume < 0)
-//  if (master_volume < 0)
-    speaker_select_laudio();
 
   status->volume = master_volume;
 
   status->plid = cur_plid;
+  status->plversion = cur_plversion;
+  status->playlistlength = queue_count(queue);
 
   switch (player_state)
     {
@@ -1901,11 +2165,14 @@ get_status(struct player_command *cmd)
 
 	status->status = PLAY_PAUSED;
 	status->id = cur_streaming->id;
+	status->item_id = cur_streaming->item_id;
 
 	pos = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES - cur_streaming->stream_start;
 	status->pos_ms = (pos * 1000) / 44100;
+	status->len_ms = cur_streaming->len_ms;
 
-	status->pos_pl = source_position(cur_streaming);
+	status->pos_pl = queue_index_byitemid(queue, cur_streaming->item_id, 0);
+
 	break;
 
       case PLAY_PLAYING:
@@ -1941,9 +2208,26 @@ get_status(struct player_command *cmd)
 	  }
 
 	status->pos_ms = (pos * 1000) / 44100;
+	status->len_ms = ps->len_ms;
 
 	status->id = ps->id;
-	status->pos_pl = source_position(ps);
+	status->item_id = ps->item_id;
+	status->pos_pl = queue_index_byitemid(queue, ps->item_id, 0);
+
+	item_next = queue_next(queue, ps->item_id, shuffle, repeat, 0);
+	if (item_next)
+	  {
+	    status->next_id = queueitem_id(item_next);
+	    status->next_item_id = queueitem_item_id(item_next);
+	    status->next_pos_pl = queue_index_byitemid(queue, status->next_item_id, 0);
+	  }
+	else
+	  {
+	    //TODO [queue/mpd] Check how mpd sets the next-id/-pos if the last song is playing
+	    status->next_id = 0;
+	    status->next_pos_pl = 0;
+	  }
+
 	break;
     }
 
@@ -1954,13 +2238,14 @@ static int
 now_playing(struct player_command *cmd)
 {
   uint32_t *id;
+  struct player_source *ps_playing;
 
   id = cmd->arg.id_ptr;
 
-  if (cur_playing)
-    *id = cur_playing->id;
-  else if (cur_streaming)
-    *id = cur_streaming->id;
+  ps_playing = source_now_playing();
+
+  if (ps_playing)
+    *id = ps_playing->id;
   else
     return -1;
 
@@ -1968,40 +2253,57 @@ now_playing(struct player_command *cmd)
 }
 
 static int
+artwork_url_get(struct player_command *cmd)
+{
+  struct player_source *ps;
+
+  cmd->arg.icy.artwork_url = NULL;
+
+  if (cur_playing)
+    ps = cur_playing;
+  else if (cur_streaming)
+    ps = cur_streaming;
+  else
+    return -1;
+
+  /* Check that we are playing a viable stream, and that it has the requested id */
+  if (!ps->xcode || ps->data_kind != DATA_KIND_HTTP || ps->id != cmd->arg.icy.id)
+    return -1;
+
+  cmd->arg.icy.artwork_url = transcode_metadata_artwork_url(ps->xcode);
+
+  return 0;
+}
+
+static int
 playback_stop(struct player_command *cmd)
 {
-//  if (laudio_status != LAUDIO_CLOSED)
-  if (laudio_enabled && laudio_status != LAUDIO_CLOSED)
-    laudio_close();
+  struct player_source *ps_playing;
 
   /* We may be restarting very soon, so we don't bring the devices to a
    * full stop just yet; this saves time when restarting, which is nicer
    * for the user.
    */
-  cmd->raop_pending = raop_flush(device_command_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
+  cmd->output_requests_pending = outputs_flush(device_command_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
 
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
+  pb_timer_stop();
 
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
+  ps_playing = source_now_playing();
+  if (ps_playing)
+    {
+      history_add(ps_playing->id, ps_playing->item_id);
+    }
 
-  if (cur_playing)
-    source_stop(cur_playing);
-  else
-    source_stop(cur_streaming);
+  source_stop();
 
-  cur_playing = NULL;
-  cur_streaming = NULL;
-
-  evbuffer_drain(audio_buf, EVBUFFER_LENGTH(audio_buf));
+  evbuffer_drain(audio_buf, evbuffer_get_length(audio_buf));
 
   status_update(PLAY_STOPPED);
 
   metadata_purge();
 
-  /* We're async if we need to flush RAOP devices */
-  if (cmd->raop_pending > 0)
+  /* We're async if we need to flush devices */
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   return 0;
@@ -2011,35 +2313,16 @@ playback_stop(struct player_command *cmd)
 static int
 playback_start_bh(struct player_command *cmd)
 {
-#if defined(__linux__)
-  struct itimerspec next;
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-  struct kevent kev;
-#endif
   int ret;
 
-  if ((laudio_status == LAUDIO_CLOSED) && (raop_sessions == 0))
+  if (output_sessions == 0)
     {
       DPRINTF(E_LOG, L_PLAYER, "Cannot start playback: no output started\n");
 
       goto out_fail;
     }
 
-  /* Start laudio first as it can fail, but can be stopped easily if needed */
-  if (laudio_status == LAUDIO_OPEN)
-    {
-      laudio_set_volume(laudio_volume);
-
-      ret = laudio_start(pb_pos, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
-      if (ret < 0)
-	{
-	  DPRINTF(E_LOG, L_PLAYER, "Local audio failed to start\n");
-
-	  goto out_fail;
-	}
-    }
-
-  ret = clock_gettime(CLOCK_MONOTONIC, &pb_pos_stamp);
+  ret = clock_gettime_with_res(CLOCK_MONOTONIC, &pb_pos_stamp, &timer_res);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_PLAYER, "Couldn't get current clock: %s\n", strerror(errno));
@@ -2047,105 +2330,58 @@ playback_start_bh(struct player_command *cmd)
       goto out_fail;
     }
 
-  memset(&pb_timer_ev, 0, sizeof(struct event));
+  pb_timer_stop();
 
-#if defined(__linux__)
+  /*
+   * initialize the packet timer to the same relative time that we have 
+   * for the playback timer.
+   */
+  packet_timer_last.tv_sec = pb_pos_stamp.tv_sec;
+  packet_timer_last.tv_nsec = pb_pos_stamp.tv_nsec;
+
   pb_timer_last.tv_sec = pb_pos_stamp.tv_sec;
   pb_timer_last.tv_nsec = pb_pos_stamp.tv_nsec;
 
-  pb_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
-  if (pb_timer_fd < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not create playback timer: %s\n", strerror(errno));
-
-      goto out_fail;
-    }
-
-  next.it_interval.tv_sec = 0;
-  next.it_interval.tv_nsec = 0;
-  next.it_value.tv_sec = pb_timer_last.tv_sec;
-  next.it_value.tv_nsec = pb_timer_last.tv_nsec;
-
-  ret = timerfd_settime(pb_timer_fd, TFD_TIMER_ABSTIME, &next, NULL);
+  ret = pb_timer_start();
   if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not set playback timer: %s\n", strerror(errno));
+    goto out_fail;
 
-      goto out_fail;
-    }
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-  pb_timer_fd = kqueue();
-  if (pb_timer_fd < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not create kqueue: %s\n", strerror(errno));
-
-      goto out_fail;
-    }
-
-  memset(&kev, 0, sizeof(struct kevent));
-
-  EV_SET(&kev, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, AIRTUNES_V2_STREAM_PERIOD, 0);
-
-  ret = kevent(pb_timer_fd, &kev, 1, NULL, 0, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not add kevent timer: %s\n", strerror(errno));
-
-      goto out_fail;
-    }
-#endif
-
-  event_set(&pb_timer_ev, pb_timer_fd, EV_READ, player_playback_cb, NULL);
-  event_base_set(evbase_player, &pb_timer_ev);
-
-  ret = event_add(&pb_timer_ev, NULL);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not set up playback timer event\n");
-
-      goto out_fail;
-    }
-
-  /* Everything OK, start RAOP */
-  if (raop_sessions > 0)
-    raop_playback_start(last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, &pb_pos_stamp);
+  /* Everything OK, start outputs */
+  outputs_playback_start(last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, &pb_pos_stamp);
 
   status_update(PLAY_PLAYING);
 
   return 0;
 
  out_fail:
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
   playback_abort();
 
   return -1;
 }
 
 static int
-playback_start(struct player_command *cmd)
+playback_start_item(struct player_command *cmd, struct queue_item *qii)
 {
-  struct raop_device *rd;
-  uint32_t *idx_id;
+  uint32_t *dbmfi_id;
+  struct output_device *device;
+  struct player_source *ps_playing;
+  struct queue_item *item;
   int ret;
 
-  if (!source_head)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Nothing to play!\n");
+  dbmfi_id = cmd->arg.playback_start_param.id_ptr;
 
-      return -1;
-    }
-
-  idx_id = cmd->arg.id_ptr;
+  ps_playing = source_now_playing();
 
   if (player_state == PLAY_PLAYING)
     {
-      if (idx_id)
+      /*
+       * If player is already playing a song, only return current playing song id
+       * and do not change player state (ignores given arguments for playing a
+       * specified song by pos or id).
+       */
+      if (dbmfi_id && ps_playing)
 	{
-	  if (cur_playing)
-	    *idx_id = cur_playing->id;
-	  else
-	    *idx_id = cur_streaming->id;
+	  *dbmfi_id = ps_playing->id;
 	}
 
       status_update(player_state);
@@ -2153,107 +2389,87 @@ playback_start(struct player_command *cmd)
       return 0;
     }
 
+  // Update global playback position
   pb_pos = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES - 88200;
 
-  if (idx_id)
+  item = NULL;
+  if (qii)
     {
-      if (cur_playing)
-	source_stop(cur_playing);
-      else if (cur_streaming)
-	source_stop(cur_streaming);
-
-      cur_playing = NULL;
-      cur_streaming = NULL;
-
-      if (shuffle)
-	{
-	  source_reshuffle();
-	  cur_streaming = shuffle_head;
-	}
-      else
-	cur_streaming = source_head;
-
-      if (*idx_id > 0)
-	{
-	  cur_streaming = source_head;
-	  for (; *idx_id > 0; (*idx_id)--)
-	    cur_streaming = cur_streaming->pl_next;
-
-	  if (shuffle)
-	    shuffle_head = cur_streaming;
-	}
-
-      ret = source_open(cur_streaming, 0);
-      if (ret < 0)
-	{
-	  DPRINTF(E_LOG, L_PLAYER, "Couldn't jump to queue position %d\n", *idx_id);
-
-	  playback_abort();
-	  return -1;
-	}
-
-      *idx_id = cur_streaming->id;
-      cur_streaming->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-      cur_streaming->output_start = cur_streaming->stream_start;
+      item = qii;
     }
   else if (!cur_streaming)
     {
       if (shuffle)
-	source_reshuffle();
-
-      ret = source_next(0);
-      if (ret < 0)
-	{
-	  DPRINTF(E_LOG, L_PLAYER, "Couldn't find anything to play!\n");
-
-	  playback_abort();
-	  return -1;
-	}
-
-      cur_streaming->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-      cur_streaming->output_start = cur_streaming->stream_start;
-    }
-  else
-    {
-      /* After a pause, the source is still open so source_open() doesn't get
-       * called and we have to handle metadata ourselves.
-       */
-      metadata_send(cur_streaming, 1);
+      	queue_shuffle(queue, 0);
+      item = queue_next(queue, 0, shuffle, repeat, 0);
     }
 
-  /* Start local audio if needed */
-  if (laudio_selected && (laudio_status == LAUDIO_CLOSED))
+  if (item)
     {
-      ret = laudio_open();
+      source_stop();
+      ret = source_open(item, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, 1);
       if (ret < 0)
 	{
-	  DPRINTF(E_LOG, L_PLAYER, "Could not open local audio\n");
-
 	  playback_abort();
 	  return -1;
 	}
     }
 
-  /* Start RAOP sessions on selected devices if needed */
-  cmd->raop_pending = 0;
-
-  for (rd = dev_list; rd; rd = rd->next)
+  ret = source_play();
+  if (ret < 0)
     {
-//      if (rd->selected && !rd->session)
-      if ( !rd->session)
+      playback_abort();
+      return -1;
+    }
+
+
+  if (dbmfi_id)
+    *dbmfi_id = cur_streaming->id;
+
+  metadata_trigger(1);
+
+  /* Start sessions on selected devices */
+  cmd->output_requests_pending = 0;
+
+  for (device = dev_list; device; device = device->next)
+    {
+      if (device->selected && !device->session)
 	{
-	  ret = raop_device_start(rd, device_restart_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
+	  ret = outputs_device_start(device, device_restart_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
 	  if (ret < 0)
 	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not start selected AirTunes device %s\n", rd->name);
+	      DPRINTF(E_LOG, L_PLAYER, "Could not start selected %s device '%s'\n", device->type_name, device->name);
 	      continue;
 	    }
 
-	  cmd->raop_pending++;
+	  DPRINTF(E_INFO, L_PLAYER, "Using selected %s device '%s'\n", device->type_name, device->name);
+	  cmd->output_requests_pending++;
 	}
     }
 
-  if ((laudio_status == LAUDIO_CLOSED) && (cmd->raop_pending == 0) && (raop_sessions == 0))
+  /* Try to autoselect a non-selected device if the above failed */
+  if ((cmd->output_requests_pending == 0) && (output_sessions == 0))
+    for (device = dev_list; device; device = device->next)
+      {
+	if ((outputs_priority(device) == 0) || device->session)
+	  continue;
+
+	speaker_select_output(device);
+	ret = outputs_device_start(device, device_restart_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
+	if (ret < 0)
+	  {
+	    DPRINTF(E_DBG, L_PLAYER, "Could not autoselect %s device '%s'\n", device->type_name, device->name);
+	    speaker_deselect_output(device);
+	    continue;
+	  }
+
+	DPRINTF(E_INFO, L_PLAYER, "Autoselecting %s device '%s'\n", device->type_name, device->name);
+	cmd->output_requests_pending++;
+	break;
+      }
+
+  /* No luck finding valid output */
+  if ((cmd->output_requests_pending == 0) && (output_sessions == 0))
     {
       DPRINTF(E_LOG, L_PLAYER, "Could not start playback: no output selected or couldn't start any output\n");
 
@@ -2261,8 +2477,8 @@ playback_start(struct player_command *cmd)
       return -1;
     }
 
-  /* We're async if we need to start RAOP devices */
-  if (cmd->raop_pending > 0)
+  /* We're async if we need to start devices */
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   /* Otherwise, just run the bottom half */
@@ -2270,30 +2486,122 @@ playback_start(struct player_command *cmd)
 }
 
 static int
+playback_start(struct player_command *cmd)
+{
+  return playback_start_item(cmd, NULL);
+}
+
+static int
+playback_start_byitemid(struct player_command *cmd)
+{
+  int item_id;
+  struct queue_item *qii;
+
+  item_id = cmd->arg.playback_start_param.id;
+
+  qii = queue_get_byitemid(queue, item_id);
+
+  return playback_start_item(cmd, qii);
+}
+
+static int
+playback_start_byindex(struct player_command *cmd)
+{
+  int pos;
+  struct queue_item *qii;
+
+  pos = cmd->arg.playback_start_param.pos;
+
+  qii = queue_get_byindex(queue, pos, 0);
+
+  return playback_start_item(cmd, qii);
+}
+
+static int
+playback_start_bypos(struct player_command *cmd)
+{
+  int offset;
+  struct player_source *ps_playing;
+  struct queue_item *qii;
+
+  offset = cmd->arg.playback_start_param.pos;
+
+  ps_playing = source_now_playing();
+
+  if (ps_playing)
+    {
+      qii = queue_get_bypos(queue, ps_playing->item_id, offset, shuffle);
+    }
+  else
+    {
+      qii = queue_get_byindex(queue, offset, shuffle);
+    }
+
+  return playback_start_item(cmd, qii);
+}
+
+static int
 playback_prev_bh(struct player_command *cmd)
 {
   int ret;
+  int pos_sec;
+  struct queue_item *item;
 
-  if (cur_playing)
-    source_stop(cur_playing);
-  else
-    source_stop(cur_streaming);
-
-  ret = source_prev();
-  if (ret < 0)
+  /*
+   * The upper half is playback_pause, therefor the current playing item is
+   * already set as the cur_streaming (cur_playing is NULL).
+   */
+  if (!cur_streaming)
     {
-      playback_abort();
-
+      DPRINTF(E_LOG, L_PLAYER, "Could not get current stream source\n");
       return -1;
+    }
+
+  /* Only add to history if playback started. */
+  if (cur_streaming->output_start > cur_streaming->stream_start)
+    history_add(cur_streaming->id, cur_streaming->item_id);
+
+  /* Compute the playing time in seconds for the current song. */
+  if (cur_streaming->output_start > cur_streaming->stream_start)
+    pos_sec = (cur_streaming->output_start - cur_streaming->stream_start) / 44100;
+  else
+    pos_sec = 0;
+
+  /* Only skip to the previous song if the playing time is less than 3 seconds,
+   otherwise restart the current song. */
+  DPRINTF(E_DBG, L_PLAYER, "Skipping song played %d sec\n", pos_sec);
+  if (pos_sec < 3)
+    {
+      item = queue_prev(queue, cur_streaming->item_id, shuffle, repeat);
+      if (!item)
+        {
+          playback_abort();
+          return -1;
+        }
+
+      source_stop();
+
+      ret = source_open(item, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, 0);
+      if (ret < 0)
+	{
+	  playback_abort();
+
+	  return -1;
+	}
+    }
+  else
+    {
+      ret = source_seek(0);
+      if (ret < 0)
+	{
+	  playback_abort();
+
+	  return -1;
+	}
     }
 
   if (player_state == PLAY_STOPPED)
     return -1;
-
-  cur_streaming->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-  cur_streaming->output_start = cur_streaming->stream_start;
-
-  cur_playing = NULL;
 
   /* Silent status change - playback_start() sends the real status update */
   player_state = PLAY_PAUSED;
@@ -2301,31 +2609,47 @@ playback_prev_bh(struct player_command *cmd)
   return 0;
 }
 
+/*
+ * The bottom half of the next command
+ */
 static int
 playback_next_bh(struct player_command *cmd)
 {
   int ret;
+  struct queue_item *item;
 
-  if (cur_playing)
-    source_stop(cur_playing);
-  else
-    source_stop(cur_streaming);
+  /*
+   * The upper half is playback_pause, therefor the current playing item is
+   * already set as the cur_streaming (cur_playing is NULL).
+   */
+  if (!cur_streaming)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not get current stream source\n");
+      return -1;
+    }
 
-  ret = source_next(1);
+  /* Only add to history if playback started. */
+  if (cur_streaming->output_start > cur_streaming->stream_start)
+    history_add(cur_streaming->id, cur_streaming->item_id);
+
+  item = queue_next(queue, cur_streaming->item_id, shuffle, repeat, 0);
+  if (!item)
+    {
+      playback_abort();
+      return -1;
+    }
+
+  source_stop();
+
+  ret = source_open(item, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES, 0);
   if (ret < 0)
     {
       playback_abort();
-
       return -1;
     }
 
   if (player_state == PLAY_STOPPED)
     return -1;
-
-  cur_streaming->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-  cur_streaming->output_start = cur_streaming->stream_start;
-
-  cur_playing = NULL;
 
   /* Silent status change - playback_start() sends the real status update */
   player_state = PLAY_PAUSED;
@@ -2336,34 +2660,19 @@ playback_next_bh(struct player_command *cmd)
 static int
 playback_seek_bh(struct player_command *cmd)
 {
-  struct player_source *ps;
   int ms;
   int ret;
 
   ms = cmd->arg.intval;
 
-  if (cur_playing)
-    ps = cur_playing;
-  else
-    ps = cur_streaming;
+  ret = source_seek(ms);
 
-  ps->end = 0;
-
-  /* Seek to commanded position */
-  ret = transcode_seek(ps->ctx, ms);
   if (ret < 0)
     {
       playback_abort();
 
       return -1;
     }
-
-  /* Adjust start_pos for the new position */
-  ps->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES - ((uint64_t)ret * 44100) / 1000;
-  ps->output_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-
-  cur_streaming = ps;
-  cur_playing = NULL;
 
   /* Silent status change - playback_start() sends the real status update */
   player_state = PLAY_PAUSED;
@@ -2374,39 +2683,23 @@ playback_seek_bh(struct player_command *cmd)
 static int
 playback_pause_bh(struct player_command *cmd)
 {
-  struct player_source *ps;
-  uint64_t pos;
-  int ms;
   int ret;
 
-  if (cur_playing)
-    ps = cur_playing;
-  else
-    ps = cur_streaming;
-
-  pos = ps->end;
-  ps->end = 0;
-
-  /* Seek back to current playback position */
-  pos -= ps->stream_start;
-  ms = (int)((pos * 1000) / 44100);
-
-  ret = transcode_seek(ps->ctx, ms);
-  if (ret < 0)
+  if (cur_streaming->data_kind == DATA_KIND_HTTP
+      || cur_streaming->data_kind == DATA_KIND_PIPE)
     {
-      playback_abort();
+      DPRINTF(E_DBG, L_PLAYER, "Source is not pausable, abort playback\n");
 
+      playback_abort();
       return -1;
     }
-
-  /* Adjust start_pos to take into account the pause and seek back */
-  ps->stream_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES - ((uint64_t)ret * 44100) / 1000;
-  ps->output_start = last_rtptime + AIRTUNES_V2_PACKET_SAMPLES;
-
-  cur_streaming = ps;
-  cur_playing = NULL;
-
   status_update(PLAY_PAUSED);
+
+  if (cur_streaming->media_kind & (MEDIA_KIND_MOVIE | MEDIA_KIND_PODCAST | MEDIA_KIND_AUDIOBOOK | MEDIA_KIND_TVSHOW))
+    {
+      ret = (cur_streaming->output_start - cur_streaming->stream_start) / 44100 * 1000;
+      db_file_save_seek(cur_streaming->id, ret);
+    }
 
   return 0;
 }
@@ -2414,7 +2707,6 @@ playback_pause_bh(struct player_command *cmd)
 static int
 playback_pause(struct player_command *cmd)
 {
-  struct player_source *ps;
   uint64_t pos;
 
   pos = source_check();
@@ -2430,38 +2722,18 @@ playback_pause(struct player_command *cmd)
   if (player_state == PLAY_STOPPED)
     return -1;
 
-  if (cur_playing)
-    ps = cur_playing;
-  else
-    ps = cur_streaming;
+  cmd->output_requests_pending = outputs_flush(device_command_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
 
-  /* Store pause position */
-  ps->end = pos;
+  pb_timer_stop();
 
-  cmd->raop_pending = raop_flush(device_command_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
+  source_pause(pos);
 
-  if (laudio_status != LAUDIO_CLOSED)
-    laudio_stop();
-
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
-
-  close(pb_timer_fd);
-  pb_timer_fd = -1;
-
-  if (ps->play_next)
-    source_stop(ps->play_next);
-
-  cur_playing = NULL;
-  cur_streaming = ps;
-  cur_streaming->play_next = NULL;
-
-  evbuffer_drain(audio_buf, EVBUFFER_LENGTH(audio_buf));
+  evbuffer_drain(audio_buf, evbuffer_get_length(audio_buf));
 
   metadata_purge();
 
-  /* We're async if we need to flush RAOP devices */
-  if (cmd->raop_pending > 0)
+  /* We're async if we need to flush devices */
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   /* Otherwise, just run the bottom half */
@@ -2471,47 +2743,28 @@ playback_pause(struct player_command *cmd)
 static int
 speaker_enumerate(struct player_command *cmd)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   struct spk_enum *spk_enum;
   struct spk_flags flags;
-  char *laudio_name;
 
   spk_enum = cmd->arg.spk_enum;
 
-  laudio_name = cfg_getstr(cfg_getsec(cfg, "audio"), "nickname");
-
-  /* Auto-select local audio if there are no AirTunes devices */
-//  if (!dev_list && !laudio_selected)
-  if (laudio_enabled && !dev_list && !laudio_selected)
-    speaker_select_laudio();
-
-  flags.selected = laudio_selected;
-  flags.has_password = 0;
-  flags.has_video = 0;
-
-  if (laudio_enabled)
-    spk_enum->cb(0, laudio_name, laudio_relvol, flags, spk_enum->arg);
-//  spk_enum->cb(0, laudio_name, laudio_relvol, flags, spk_enum->arg);
-
 #ifdef DEBUG_RELVOL
   DPRINTF(E_DBG, L_PLAYER, "*** master: %d\n", master_volume);
-  if (laudio_enabled)
-    DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
-//  DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
 #endif
 
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      if (rd->advertised || rd->selected)
+      if (device->advertised || device->selected)
 	{
-	  flags.selected = rd->selected;
-	  flags.has_password = rd->has_password;
-	  flags.has_video = (rd->devtype == RAOP_DEV_APPLETV);
+	  flags.selected = device->selected;
+	  flags.has_password = device->has_password;
+	  flags.has_video = device->has_video;
 
-	  spk_enum->cb(rd->id, rd->name, rd->relvol, flags, spk_enum->arg);
+	  spk_enum->cb(device->id, device->name, device->relvol, flags, spk_enum->arg);
 
 #ifdef DEBUG_RELVOL
-	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
+	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", device->name, device->volume, device->relvol);
 #endif
 	}
     }
@@ -2520,131 +2773,63 @@ speaker_enumerate(struct player_command *cmd)
 }
 
 static int
-speaker_activate(struct raop_device *rd)
+speaker_activate(struct output_device *device)
 {
-  struct timespec ts;
-  uint64_t pos;
   int ret;
 
-//  if (!rd)
-  if (!rd && laudio_enabled)
+  if (!device)
     {
-      /* Local */
-      DPRINTF(E_DBG, L_PLAYER, "Activating local audio\n");
+      DPRINTF(E_LOG, L_PLAYER, "Bug! speaker_activate called with device\n");
+      return -1;
+    }
 
-      if (laudio_status == LAUDIO_CLOSED)
+  if (player_state == PLAY_PLAYING)
+    {
+      DPRINTF(E_DBG, L_PLAYER, "Activating %s device '%s'\n", device->type_name, device->name);
+
+      ret = outputs_device_start(device, device_activate_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
+      if (ret < 0)
 	{
-	  ret = laudio_open();
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not open local audio\n");
-
-	      return -1;
-	    }
+	  DPRINTF(E_LOG, L_PLAYER, "Could not start %s device '%s'\n", device->type_name, device->name);
+	  return -1;
 	}
-
-      if (player_state == PLAY_PLAYING)
-	{
-	  laudio_set_volume(laudio_volume);
-
-	  ret = player_get_current_pos(&pos, &ts, 0);
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not get current stream position for local audio start\n");
-
-	      laudio_close();
-	      return -1;
-	    }
-
-	  ret = laudio_start(pos, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Local playback failed to start\n");
-
-	      laudio_close();
-	      return -1;
-	    }
-	}
-
-      return 0;
     }
   else
     {
-      /* RAOP */
-      if (player_state == PLAY_PLAYING)
+      DPRINTF(E_DBG, L_PLAYER, "Probing %s device '%s'\n", device->type_name, device->name);
+
+      ret = outputs_device_probe(device, device_probe_cb);
+      if (ret < 0)
 	{
-	  DPRINTF(E_DBG, L_PLAYER, "Activating RAOP device %s\n", rd->name);
-
-	  ret = raop_device_start(rd, device_activate_cb, last_rtptime + AIRTUNES_V2_PACKET_SAMPLES);
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not start device %s\n", rd->name);
-
-	      return -1;
-	    }
+	  DPRINTF(E_LOG, L_PLAYER, "Could not probe %s device '%s'\n", device->type_name, device->name);
+	  return -1;
 	}
-      else
-	{
-	  DPRINTF(E_DBG, L_PLAYER, "Probing RAOP device %s\n", rd->name);
-
-	  ret = raop_device_probe(rd, device_probe_cb);
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not probe device %s\n", rd->name);
-
-	      return -1;
-	    }
-	}
-
-      return 1;
     }
 
-  return -1;
+  return 0;
 }
 
 static int
-speaker_deactivate(struct raop_device *rd)
+speaker_deactivate(struct output_device *device)
 {
-//  if (!rd)
-  if (!rd && laudio_enabled)
-    {
-      /* Local */
-      DPRINTF(E_DBG, L_PLAYER, "Deactivating local audio\n");
+  DPRINTF(E_DBG, L_PLAYER, "Deactivating %s device '%s'\n", device->type_name, device->name);
 
-      if (laudio_status == LAUDIO_CLOSED)
-	return 0;
+  outputs_status_cb(device->session, device_shutdown_cb);
+  outputs_device_stop(device->session);
 
-      if (laudio_status & LAUDIO_F_STARTED)
-	laudio_stop();
-
-      laudio_close();
-
-      return 0;
-    }
-  else
-    {
-      /* RAOP */
-      DPRINTF(E_DBG, L_PLAYER, "Deactivating RAOP device %s\n", rd->name);
-
-      raop_set_status_cb(rd->session, device_shutdown_cb);
-      raop_device_stop(rd->session);
-
-      return 1;
-    }
-
-  return -1;
+  return 0;
 }
 
 static int
 speaker_set(struct player_command *cmd)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   uint64_t *ids;
   int nspk;
   int i;
   int ret;
 
-  ids = cmd->arg.raop_ids;
+  ids = cmd->arg.device_ids;
 
   if (ids)
     nspk = ids[0];
@@ -2653,128 +2838,76 @@ speaker_set(struct player_command *cmd)
 
   DPRINTF(E_DBG, L_PLAYER, "Speaker set: %d speakers\n", nspk);
 
-  cmd->raop_pending = 0;
+  cmd->output_requests_pending = 0;
   cmd->ret = 0;
 
-  /* RAOP devices */
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
       for (i = 1; i <= nspk; i++)
 	{
-	  DPRINTF(E_DBG, L_PLAYER, "Set %" PRIu64 " device %" PRIu64 "\n", ids[i], rd->id);
+	  DPRINTF(E_DBG, L_PLAYER, "Set %" PRIu64 " device %" PRIu64 "\n", ids[i], device->id);
 
-	  if (ids[i] == rd->id)
+	  if (ids[i] == device->id)
 	    break;
 	}
 
       if (i <= nspk)
 	{
-	  if (rd->has_password && !rd->password)
+	  if (device->has_password && !device->password)
 	    {
-	      DPRINTF(E_INFO, L_PLAYER, "RAOP device %s is password-protected, but we don't have it\n", rd->name);
+	      DPRINTF(E_INFO, L_PLAYER, "The %s device '%s' is password-protected, but we don't have it\n", device->type_name, device->name);
 
 	      cmd->ret = -2;
 	      continue;
 	    }
 
-	  DPRINTF(E_DBG, L_PLAYER, "RAOP device %s selected\n", rd->name);
+	  DPRINTF(E_DBG, L_PLAYER, "The %s device '%s' is selected\n", device->type_name, device->name);
 
-	  if (!rd->selected)
-	    speaker_select_raop(rd);
+	  if (!device->selected)
+	    speaker_select_output(device);
 
-	  if (!rd->session)
+	  if (!device->session)
 	    {
-	      ret = speaker_activate(rd);
+	      ret = speaker_activate(device);
 	      if (ret < 0)
 		{
-		  DPRINTF(E_LOG, L_PLAYER, "Could not activate RAOP device %s\n", rd->name);
+		  DPRINTF(E_LOG, L_PLAYER, "Could not activate %s device '%s'\n", device->type_name, device->name);
 
-		  speaker_deselect_raop(rd);
+		  speaker_deselect_output(device);
 
 		  if (cmd->ret != -2)
 		    cmd->ret = -1;
 		}
-
-	      /* ret = 1 if RAOP needs to take action */
-	      cmd->raop_pending += ret;
+	      else
+		cmd->output_requests_pending++;
 	    }
 	}
       else
 	{
-	  DPRINTF(E_DBG, L_PLAYER, "RAOP device %s NOT selected\n", rd->name);
+	  DPRINTF(E_DBG, L_PLAYER, "The %s device '%s' is NOT selected\n", device->type_name, device->name);
 
-	  if (rd->selected)
-	    speaker_deselect_raop(rd);
+	  if (device->selected)
+	    speaker_deselect_output(device);
 
-	  if (rd->session)
+	  if (device->session)
 	    {
-	      ret = speaker_deactivate(rd);
+	      ret = speaker_deactivate(device);
 	      if (ret < 0)
 		{
-		  DPRINTF(E_LOG, L_PLAYER, "Could not deactivate RAOP device %s\n", rd->name);
+		  DPRINTF(E_LOG, L_PLAYER, "Could not deactivate %s device '%s'\n", device->type_name, device->name);
 
 		  if (cmd->ret != -2)
 		    cmd->ret = -1;
 		}
-
-	      /* ret = 1 if RAOP needs to take action */
-	      cmd->raop_pending += ret;
+	      else
+		cmd->output_requests_pending++;
 	    }
 	}
     }
 
-  /* Local audio */
-  if(laudio_enabled)
-     {
-      for (i = 1; i <= nspk; i++)
-        {
-          if (ids[i] == 0)
-          break;
-        }
- 
-      if (i <= nspk)
-        {
-          DPRINTF(E_DBG, L_PLAYER, "Local audio selected\n");
- 
-          if (!laudio_selected)
-            speaker_select_laudio();
- 
-          if (!(laudio_status & LAUDIO_F_STARTED))
-            {
-              ret = speaker_activate(NULL);
-              if (ret < 0)
-                {
-                  DPRINTF(E_LOG, L_PLAYER, "Could not activate local audio output\n");
- 
-                  speaker_deselect_laudio();
- 
-                  if (cmd->ret != -2)
-                    cmd->ret = -1;
-                }
-            }
-        }
-      else
-        {
-          DPRINTF(E_DBG, L_PLAYER, "Local audio NOT selected\n");
+  listener_notify(LISTENER_SPEAKER);
 
-      if (laudio_selected)
-	speaker_deselect_laudio();
-
-      if (laudio_status != LAUDIO_CLOSED)
-	{
-	  ret = speaker_deactivate(NULL);
-	  if (ret < 0)
-	    {
-	      DPRINTF(E_LOG, L_PLAYER, "Could not deactivate local audio output\n");
-
-	      if (cmd->ret != -2)
-		cmd->ret = -1;
-                }
-	    }
-	}
-    }
-
-  if (cmd->raop_pending > 0)
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   return cmd->ret;
@@ -2783,7 +2916,7 @@ speaker_set(struct player_command *cmd)
 static int
 volume_set(struct player_command *cmd)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   int volume;
 
   volume = cmd->arg.intval;
@@ -2793,35 +2926,26 @@ volume_set(struct player_command *cmd)
 
   master_volume = volume;
 
-  if (laudio_selected)
+  cmd->output_requests_pending = 0;
+
+  for (device = dev_list; device; device = device->next)
     {
-      laudio_volume = rel_to_vol(laudio_relvol);
-      laudio_set_volume(laudio_volume);
-
-#ifdef DEBUG_RELVOL
-      DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
-#endif
-    }
-
-  cmd->raop_pending = 0;
-
-  for (rd = dev_list; rd; rd = rd->next)
-    {
-/*    	
-      if (!rd->selected)
+      if (!device->selected)
 	continue;
-*/
-      rd->volume = rel_to_vol(rd->relvol);
+
+      device->volume = rel_to_vol(device->relvol);
 
 #ifdef DEBUG_RELVOL
-      DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
+      DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", device->name, device->volume, device->relvol);
 #endif
 
-      if (rd->session)
-	cmd->raop_pending += raop_set_volume_one(rd->session, rd->volume, device_command_cb);
+      if (device->session)
+	cmd->output_requests_pending += outputs_device_volume_set(device, device_command_cb);
     }
 
-  if (cmd->raop_pending > 0)
+  listener_notify(LISTENER_VOLUME);
+
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   return 0;
@@ -2830,48 +2954,37 @@ volume_set(struct player_command *cmd)
 static int
 volume_setrel_speaker(struct player_command *cmd)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   uint64_t id;
   int relvol;
 
   id = cmd->arg.vol_param.spk_id;
   relvol = cmd->arg.vol_param.volume;
 
-  if (id == 0)
+  for (device = dev_list; device; device = device->next)
     {
-      laudio_relvol = relvol;
-      laudio_volume = rel_to_vol(relvol);
-      laudio_set_volume(laudio_volume);
+      if (device->id != id)
+	continue;
+
+      if (!device->selected)
+	return 0;
+
+      device->relvol = relvol;
+      device->volume = rel_to_vol(relvol);
 
 #ifdef DEBUG_RELVOL
-      DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
-#endif
-    }
-  else
-    {
-      for (rd = dev_list; rd; rd = rd->next)
-        {
-	  if (rd->id != id)
-	    continue;
-
-	  if (!rd->selected)
-	    return 0;
-
-	  rd->relvol = relvol;
-	  rd->volume = rel_to_vol(relvol);
-
-#ifdef DEBUG_RELVOL
-	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
+      DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", device->name, device->volume, device->relvol);
 #endif
 
-	  if (rd->session)
-	    cmd->raop_pending = raop_set_volume_one(rd->session, rd->volume, device_command_cb);
+      if (device->session)
+	cmd->output_requests_pending = outputs_device_volume_set(device, device_command_cb);
 
-	  break;
-        }
+      break;
     }
 
-  if (cmd->raop_pending > 0)
+  listener_notify(LISTENER_VOLUME);
+
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   return 0;
@@ -2880,7 +2993,7 @@ volume_setrel_speaker(struct player_command *cmd)
 static int
 volume_setabs_speaker(struct player_command *cmd)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   uint64_t id;
   int volume;
 
@@ -2889,48 +3002,37 @@ volume_setabs_speaker(struct player_command *cmd)
 
   master_volume = volume;
 
-  if (id == 0)
+  for (device = dev_list; device; device = device->next)
     {
-      laudio_relvol = 100;
-      laudio_volume = volume;
-      laudio_set_volume(laudio_volume);
-    }
-  else
-    laudio_relvol = vol_to_rel(laudio_volume);
-
-#ifdef DEBUG_RELVOL
-  DPRINTF(E_DBG, L_PLAYER, "*** laudio: abs %d rel %d\n", laudio_volume, laudio_relvol);
-#endif
-
-  for (rd = dev_list; rd; rd = rd->next)
-    {
-      if (!rd->selected)
+      if (!device->selected)
 	continue;
 
-      if (rd->id != id)
+      if (device->id != id)
 	{
-	  rd->relvol = vol_to_rel(rd->volume);
+	  device->relvol = vol_to_rel(device->volume);
 
 #ifdef DEBUG_RELVOL
-	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
+	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", device->name, device->volume, device->relvol);
 #endif
 	  continue;
 	}
       else
 	{
-	  rd->relvol = 100;
-	  rd->volume = master_volume;
+	  device->relvol = 100;
+	  device->volume = master_volume;
 
 #ifdef DEBUG_RELVOL
-	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", rd->name, rd->volume, rd->relvol);
+	  DPRINTF(E_DBG, L_PLAYER, "*** %s: abs %d rel %d\n", device->name, device->volume, device->relvol);
 #endif
 
-	  if (rd->session)
-	    cmd->raop_pending = raop_set_volume_one(rd->session, rd->volume, device_command_cb);
+	  if (device->session)
+	    cmd->output_requests_pending = outputs_device_volume_set(device, device_command_cb);
 	}
     }
 
-  if (cmd->raop_pending > 0)
+  listener_notify(LISTENER_VOLUME);
+
+  if (cmd->output_requests_pending > 0)
     return 1; /* async */
 
   return 0;
@@ -2939,6 +3041,9 @@ volume_setabs_speaker(struct player_command *cmd)
 static int
 repeat_set(struct player_command *cmd)
 {
+  if (cmd->arg.mode == repeat)
+    return 0;
+
   switch (cmd->arg.mode)
     {
       case REPEAT_OFF:
@@ -2952,17 +3057,24 @@ repeat_set(struct player_command *cmd)
 	return -1;
     }
 
+  listener_notify(LISTENER_OPTIONS);
+
   return 0;
 }
 
 static int
 shuffle_set(struct player_command *cmd)
 {
+  uint32_t cur_id;
+
   switch (cmd->arg.intval)
     {
       case 1:
 	if (!shuffle)
-	  source_reshuffle();
+	  {
+	    cur_id = cur_streaming ? cur_streaming->item_id : 0;
+	    queue_shuffle(queue, cur_id);
+	  }
 	/* FALLTHROUGH*/
       case 0:
 	shuffle = cmd->arg.intval;
@@ -2973,95 +3085,275 @@ shuffle_set(struct player_command *cmd)
 	return -1;
     }
 
-  return 0;
-}
-
-static int
-queue_add(struct player_command *cmd)
-{
-  struct player_source *ps;
-  struct player_source *ps_shuffle;
-  struct player_source *source_tail;
-  struct player_source *ps_tail;
-
-  ps = cmd->arg.ps;
-
-  ps_shuffle = source_shuffle(ps);
-  if (!ps_shuffle)
-    ps_shuffle = ps;
-
-  if (source_head)
-    {
-      /* Playlist order */
-      source_tail = source_head->pl_prev;
-      ps_tail = ps->pl_prev;
-
-      source_tail->pl_next = ps;
-      ps_tail->pl_next = source_head;
-
-      source_head->pl_prev = ps_tail;
-      ps->pl_prev = source_tail;
-
-      /* Shuffle */
-      source_tail = shuffle_head->shuffle_prev;
-      ps_tail = ps_shuffle->shuffle_prev;
-
-      source_tail->shuffle_next = ps_shuffle;
-      ps_tail->shuffle_next = shuffle_head;
-
-      shuffle_head->shuffle_prev = ps_tail;
-      ps_shuffle->shuffle_prev = source_tail;
-    }
-  else
-    {
-      source_head = ps;
-      shuffle_head = ps_shuffle;
-    }
-
-  if (cur_plid != 0)
-    cur_plid = 0;
+  listener_notify(LISTENER_OPTIONS);
 
   return 0;
 }
 
 static int
-queue_clear(struct player_command *cmd)
+playerqueue_get_bypos(struct player_command *cmd)
 {
+  int count;
+  struct queue *qi;
   struct player_source *ps;
+  int item_id;
 
-  if (!source_head)
-    return 0;
+  count = cmd->arg.queue_get_param.count;
 
-  shuffle_head = NULL;
-  source_head->pl_prev->pl_next = NULL;
+  ps = source_now_playing();
 
-  for (ps = source_head; ps; ps = source_head)
+  item_id = 0;
+  if (ps)
     {
-      source_head = ps->pl_next;
-
-      source_free(ps);
+      item_id = ps->item_id;
     }
+
+  qi = queue_new_bypos(queue, item_id, count, shuffle);
+
+  cmd->arg.queue_get_param.queue = qi;
+
+  return 0;
+}
+
+static int
+playerqueue_get_byindex(struct player_command *cmd)
+{
+  int pos;
+  int count;
+  struct queue *qi;
+
+  pos = cmd->arg.queue_get_param.pos;
+  count = cmd->arg.queue_get_param.count;
+
+  qi = queue_new_byindex(queue, pos, count, 0);
+  cmd->arg.queue_get_param.queue = qi;
+
+  return 0;
+}
+
+static int
+playerqueue_add(struct player_command *cmd)
+{
+  struct queue_item *items;
+  uint32_t cur_id;
+  uint32_t *item_id;
+
+  items = cmd->arg.queue_add_param.items;
+  item_id = cmd->arg.queue_add_param.item_id_ptr;
+
+  queue_add(queue, items);
+
+  if (shuffle)
+    {
+      cur_id = cur_streaming ? cur_streaming->item_id : 0;
+      queue_shuffle(queue, cur_id);
+    }
+
+  if (item_id)
+    *item_id = queueitem_item_id(items);
 
   cur_plid = 0;
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
 
   return 0;
 }
 
 static int
-queue_plid(struct player_command *cmd)
+playerqueue_add_next(struct player_command *cmd)
 {
-  if (!source_head)
-    return 0;
+  struct queue_item *items;
+  uint32_t cur_id;
 
+  items = cmd->arg.queue_add_param.items;
+
+  cur_id = cur_streaming ? cur_streaming->item_id : 0;
+
+  queue_add_after(queue, items, cur_id);
+
+  if (shuffle)
+    queue_shuffle(queue, cur_id);
+
+  cur_plid = 0;
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_move_bypos(struct player_command *cmd)
+{
+  struct player_source *ps_playing;
+  uint32_t item_id;
+
+  DPRINTF(E_DBG, L_PLAYER, "Moving song from position %d to be the next song after %d\n",
+      cmd->arg.queue_move_param.from_pos, cmd->arg.queue_move_param.to_pos);
+
+  ps_playing = source_now_playing();
+
+  if (!ps_playing)
+    {
+      DPRINTF(E_DBG, L_PLAYER, "No playing item found for move by pos\n");
+      item_id = 0;
+    }
+  else
+    item_id = ps_playing->item_id;
+
+  queue_move_bypos(queue, item_id, cmd->arg.queue_move_param.from_pos, cmd->arg.queue_move_param.to_pos, shuffle);
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_move_byindex(struct player_command *cmd)
+{
+  DPRINTF(E_DBG, L_PLAYER, "Moving song from index %d to be the next song after %d\n",
+      cmd->arg.queue_move_param.from_pos, cmd->arg.queue_move_param.to_pos);
+
+  queue_move_byindex(queue, cmd->arg.queue_move_param.from_pos, cmd->arg.queue_move_param.to_pos, 0);
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_move_byitemid(struct player_command *cmd)
+{
+  DPRINTF(E_DBG, L_PLAYER, "Moving song with item-id %d to be the next song after index %d\n",
+      cmd->arg.queue_move_param.item_id, cmd->arg.queue_move_param.to_pos);
+
+  queue_move_byitemid(queue, cmd->arg.queue_move_param.item_id, cmd->arg.queue_move_param.to_pos, 0);
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_remove_bypos(struct player_command *cmd)
+{
+  int pos;
+  struct player_source *ps_playing;
+  uint32_t item_id;
+
+  pos = cmd->arg.intval;
+  if (pos < 1)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Can't remove item, invalid position %d\n", pos);
+      return -1;
+    }
+
+  ps_playing = source_now_playing();
+
+  if (!ps_playing)
+    {
+      DPRINTF(E_DBG, L_PLAYER, "No playing item for remove by pos\n");
+      item_id = 0;
+    }
+  else
+    item_id = ps_playing->item_id;
+
+  DPRINTF(E_DBG, L_PLAYER, "Removing item from position %d\n", pos);
+  queue_remove_bypos(queue, item_id, pos, shuffle);
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_remove_byindex(struct player_command *cmd)
+{
+  int pos;
+  int count;
+  int i;
+
+  pos = cmd->arg.queue_remove_param.from_pos;
+  count = cmd->arg.queue_remove_param.count;
+
+  DPRINTF(E_DBG, L_PLAYER, "Removing %d items starting from position %d\n", count, pos);
+
+  for (i = 0; i < count; i++)
+    queue_remove_byindex(queue, pos, 0);
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_remove_byitemid(struct player_command *cmd)
+{
+  uint32_t id;
+
+  id = cmd->arg.id;
+  if (id < 1)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Can't remove item, invalid id %d\n", id);
+      return -1;
+    }
+
+  DPRINTF(E_DBG, L_PLAYER, "Removing item with id %d\n", id);
+  queue_remove_byitemid(queue, id);
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+/*
+ * Removes all media items from the queue
+ */
+static int
+playerqueue_clear(struct player_command *cmd)
+{
+  queue_clear(queue);
+
+  cur_plid = 0;
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+/*
+ * Removes all items from the history
+ */
+static int
+playerqueue_clear_history(struct player_command *cmd)
+{
+  memset(history, 0, sizeof(struct player_history));
+
+  cur_plversion++;
+
+  listener_notify(LISTENER_PLAYLIST);
+
+  return 0;
+}
+
+static int
+playerqueue_plid(struct player_command *cmd)
+{
   cur_plid = cmd->arg.id;
-
-  return 0;
-}
-
-static int
-set_update_handler(struct player_command *cmd)
-{
-  update_handler = cmd->arg.status_handler;
 
   return 0;
 }
@@ -3115,7 +3407,7 @@ command_cb(int fd, short what, void *arg)
     }
 
  readd:
-  event_add(&cmdev, NULL);
+  event_add(cmdev, NULL);
 }
 
 
@@ -3181,7 +3473,6 @@ sync_command(struct player_command *cmd)
   return ret;
 }
 
-
 /* Player API executed in the httpd (DACP) thread */
 int
 player_get_status(struct player_status *status)
@@ -3202,6 +3493,12 @@ player_get_status(struct player_status *status)
   return ret;
 }
 
+/*
+ * Stores the now playing media item dbmfi-id in the given id pointer.
+ *
+ * @param id Pointer will hold the playing item (dbmfi) id if the function returns 0
+ * @return 0 on success, -1 on failure (e. g. no playing item found)
+ */
 int
 player_now_playing(uint32_t *id)
 {
@@ -3221,8 +3518,46 @@ player_now_playing(uint32_t *id)
   return ret;
 }
 
+char *
+player_get_icy_artwork_url(uint32_t id)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = artwork_url_get;
+  cmd.func_bh = NULL;
+  cmd.arg.icy.id = id;
+
+  if (pthread_self() != tid_player)
+    ret = sync_command(&cmd);
+  else
+    ret = artwork_url_get(&cmd);
+
+  command_deinit(&cmd);
+
+  if (ret < 0)
+    return NULL;
+  else
+    return cmd.arg.icy.artwork_url;
+}
+
+/*
+ * Starts/resumes playback
+ *
+ * Depending on the player state, this will either resume playing the current item (player is paused)
+ * or begin playing the queue from the beginning.
+ *
+ * If shuffle is set, the queue is reshuffled prior to starting playback.
+ *
+ * If a pointer is given as argument "itemid", its value will be set to the playing item dbmfi-id.
+ *
+ * @param *id if not NULL, will be set to the playing item dbmfi-id
+ * @return 0 if successful, -1 if an error occurred
+ */
 int
-player_playback_start(uint32_t *idx_id)
+player_playback_start(uint32_t *id)
 {
   struct player_command cmd;
   int ret;
@@ -3231,8 +3566,100 @@ player_playback_start(uint32_t *idx_id)
 
   cmd.func = playback_start;
   cmd.func_bh = playback_start_bh;
-  cmd.arg.id_ptr = idx_id;
+  cmd.arg.playback_start_param.id_ptr = id;
 
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Starts playback with the media item at the given index of the play-queue.
+ *
+ * If shuffle is set, the queue is reshuffled prior to starting playback.
+ *
+ * If a pointer is given as argument "itemid", its value will be set to the playing item id.
+ *
+ * @param index the index of the item in the play-queue
+ * @param *id if not NULL, will be set to the playing item id
+ * @return 0 if successful, -1 if an error occurred
+ */
+int
+player_playback_start_byindex(int index, uint32_t *id)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playback_start_byindex;
+  cmd.func_bh = playback_start_bh;
+  cmd.arg.playback_start_param.pos = index;
+  cmd.arg.playback_start_param.id_ptr = id;
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Starts playback with the media item at the given position in the UpNext-queue.
+ * The UpNext-queue consists of all items of the play-queue (shuffle off) or shuffle-queue
+ * (shuffle on) after the current playing item (starting with position 0).
+ *
+ * If shuffle is set, the queue is reshuffled prior to starting playback.
+ *
+ * If a pointer is given as argument "itemid", its value will be set to the playing item dbmfi-id.
+ *
+ * @param pos the position in the UpNext-queue (zero-based)
+ * @param *id if not NULL, will be set to the playing item dbmfi-id
+ * @return 0 if successful, -1 if an error occurred
+ */
+int
+player_playback_start_bypos(int pos, uint32_t *id)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playback_start_bypos;
+  cmd.func_bh = playback_start_bh;
+  cmd.arg.playback_start_param.pos = pos;
+  cmd.arg.playback_start_param.id_ptr = id;
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Starts playback with the media item with the given (queueitem) item-id in queue
+ *
+ * If shuffle is set, the queue is reshuffled prior to starting playback.
+ *
+ * If a pointer is given as argument "itemid", its value will be set to the playing item dbmfi-id.
+ *
+ * @param item_id The queue-item-id
+ * @param *id if not NULL, will be set to the playing item dbmfi-id
+ * @return 0 if successful, -1 if an error occurred
+ */
+int
+player_playback_start_byitemid(uint32_t item_id, uint32_t *id)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playback_start_byitemid;
+  cmd.func_bh = playback_start_bh;
+  cmd.arg.playback_start_param.id = item_id;
+  cmd.arg.playback_start_param.id_ptr = id;
   ret = sync_command(&cmd);
 
   command_deinit(&cmd);
@@ -3334,6 +3761,7 @@ player_playback_prev(void)
   return ret;
 }
 
+
 void
 player_speaker_enumerate(spk_enum_cb cb, void *arg)
 {
@@ -3364,7 +3792,7 @@ player_speaker_set(uint64_t *ids)
 
   cmd.func = speaker_set;
   cmd.func_bh = NULL;
-  cmd.arg.raop_ids = ids;
+  cmd.arg.device_ids = ids;
 
   ret = sync_command(&cmd);
 
@@ -3470,17 +3898,256 @@ player_shuffle_set(int enable)
   return ret;
 }
 
-int
-player_queue_add(struct player_source *ps)
+/*
+ * Returns the queue info for max "count" media items in the UpNext-queue
+ *
+ * The UpNext-queue consists of all items of the play-queue (shuffle off) or shuffle-queue
+ * (shuffle on) after the current playing item (starting with position 0).
+ *
+ * @param count max number of media items to return
+ * @return queue info
+ */
+struct queue *
+player_queue_get_bypos(int count)
 {
   struct player_command cmd;
   int ret;
 
   command_init(&cmd);
 
-  cmd.func = queue_add;
+  cmd.func = playerqueue_get_bypos;
   cmd.func_bh = NULL;
-  cmd.arg.ps = ps;
+  cmd.arg.queue_get_param.pos = -1;
+  cmd.arg.queue_get_param.count = count;
+  cmd.arg.queue_get_param.queue = NULL;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  if (ret != 0)
+    return NULL;
+
+  return cmd.arg.queue_get_param.queue;
+}
+
+/*
+ * Returns the queue info for max "count" media items starting with the item at the given
+ * index in the play-queue
+ *
+ * @param index Index of the play-queue for the first item
+ * @param count max number of media items to return
+ * @return queue info
+ */
+struct queue *
+player_queue_get_byindex(int index, int count)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_get_byindex;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_get_param.pos = index;
+  cmd.arg.queue_get_param.count = count;
+  cmd.arg.queue_get_param.queue = NULL;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  if (ret != 0)
+    return NULL;
+
+  return cmd.arg.queue_get_param.queue;
+}
+
+/*
+ * Appends the given media items to the queue
+ */
+int
+player_queue_add(struct queue_item *items, uint32_t *item_id)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_add;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_add_param.items = items;
+  cmd.arg.queue_add_param.item_id_ptr = item_id;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Adds the given media items directly after the current playing/streaming media item
+ */
+int
+player_queue_add_next(struct queue_item *items)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_add_next;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_add_param.items = items;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Moves the media item at 'pos_from' to 'pos_to' in the UpNext-queue.
+ *
+ * The UpNext-queue consists of all items of the play-queue (shuffle off) or shuffle-queue
+ * (shuffle on) after the current playing item (starting with position 0).
+ */
+int
+player_queue_move_bypos(int pos_from, int pos_to)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_move_bypos;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_move_param.from_pos = pos_from;
+  cmd.arg.queue_move_param.to_pos = pos_to;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+int
+player_queue_move_byindex(int pos_from, int pos_to)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_move_byindex;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_move_param.from_pos = pos_from;
+  cmd.arg.queue_move_param.to_pos = pos_to;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+int
+player_queue_move_byitemid(uint32_t item_id, int pos_to)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_move_byitemid;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_move_param.item_id = item_id;
+  cmd.arg.queue_move_param.to_pos = pos_to;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Removes the media item at the given position from the UpNext-queue
+ *
+ * The UpNext-queue consists of all items of the play-queue (shuffle off) or shuffle-queue
+ * (shuffle on) after the current playing item (starting with position 0).
+ *
+ * @param pos Position in the UpNext-queue (0-based)
+ * @return 0 on success, -1 on failure
+ */
+int
+player_queue_remove_bypos(int pos)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_remove_bypos;
+  cmd.func_bh = NULL;
+  cmd.arg.intval = pos;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Removes the media item at the given position from the UpNext-queue
+ *
+ * The UpNext-queue consists of all items of the play-queue (shuffle off) or shuffle-queue
+ * (shuffle on) after the current playing item (starting with position 0).
+ *
+ * @param pos Position in the UpNext-queue (0-based)
+ * @return 0 on success, -1 on failure
+ */
+int
+player_queue_remove_byindex(int pos, int count)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_remove_byindex;
+  cmd.func_bh = NULL;
+  cmd.arg.queue_remove_param.from_pos = pos;
+  cmd.arg.queue_remove_param.count = count;
+
+  ret = sync_command(&cmd);
+
+  command_deinit(&cmd);
+
+  return ret;
+}
+
+/*
+ * Removes the item with the given (queueitem) item id from the queue
+ *
+ * @param id Id of the queue item to remove
+ * @return 0 on success, -1 on failure
+ */
+int
+player_queue_remove_byitemid(uint32_t id)
+{
+  struct player_command cmd;
+  int ret;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_remove_byitemid;
+  cmd.func_bh = NULL;
+  cmd.arg.id = id;
 
   ret = sync_command(&cmd);
 
@@ -3496,9 +4163,24 @@ player_queue_clear(void)
 
   command_init(&cmd);
 
-  cmd.func = queue_clear;
+  cmd.func = playerqueue_clear;
   cmd.func_bh = NULL;
   cmd.arg.noarg = NULL;
+
+  sync_command(&cmd);
+
+  command_deinit(&cmd);
+}
+
+void
+player_queue_clear_history()
+{
+  struct player_command cmd;
+
+  command_init(&cmd);
+
+  cmd.func = playerqueue_clear_history;
+  cmd.func_bh = NULL;
 
   sync_command(&cmd);
 
@@ -3512,7 +4194,7 @@ player_queue_plid(uint32_t plid)
 
   command_init(&cmd);
 
-  cmd.func = queue_plid;
+  cmd.func = playerqueue_plid;
   cmd.func_bh = NULL;
   cmd.arg.id = plid;
 
@@ -3521,267 +4203,85 @@ player_queue_plid(uint32_t plid)
   command_deinit(&cmd);
 }
 
-void
-player_set_update_handler(player_status_handler handler)
+/* Non-blocking commands used by mDNS */
+int
+player_device_add(void *device)
+{
+  struct player_command *cmd;
+  int ret;
+
+  cmd = calloc(1, sizeof(struct player_command));
+  if (!cmd)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not allocate player_command\n");
+      return -1;
+    }
+
+  cmd->nonblock = 1;
+
+  cmd->func = device_add;
+  cmd->arg.device = device;
+
+  ret = nonblock_command(cmd);
+  if (ret < 0)
+    {
+      free(cmd);
+      return -1;
+    }
+
+  return 0;
+}
+
+int
+player_device_remove(void *device)
+{
+  struct player_command *cmd;
+  int ret;
+
+  cmd = calloc(1, sizeof(struct player_command));
+  if (!cmd)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not allocate player_command\n");
+      return -1;
+    }
+
+  cmd->nonblock = 1;
+
+  cmd->func = device_remove_family;
+  cmd->arg.device = device;
+
+  ret = nonblock_command(cmd);
+  if (ret < 0)
+    {
+      free(cmd);
+      return -1;
+    }
+
+  return 0;
+}
+
+/* Thread: worker */
+static void
+player_metadata_send(struct player_metadata *pmd)
 {
   struct player_command cmd;
 
   command_init(&cmd);
 
-  cmd.func = set_update_handler;
+  cmd.func = metadata_send;
   cmd.func_bh = NULL;
-  cmd.arg.status_handler = handler;
+  cmd.arg.pmd = pmd;
 
   sync_command(&cmd);
 
   command_deinit(&cmd);
 }
 
-/* Non-blocking commands used by mDNS */
-static void
-player_device_add(struct raop_device *rd)
-{
-  struct player_command *cmd;
-  int ret;
-
-  cmd = (struct player_command *)malloc(sizeof(struct player_command));
-  if (!cmd)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not allocate player_command\n");
-
-      device_free(rd);
-      return;
-    }
-
-  memset(cmd, 0, sizeof(struct player_command));
-
-  cmd->nonblock = 1;
-
-  cmd->func = device_add;
-  cmd->arg.rd = rd;
-
-  ret = nonblock_command(cmd);
-  if (ret < 0)
-    {
-      free(cmd);
-      device_free(rd);
-
-      return;
-    }
-}
-
-static void
-player_device_remove(struct raop_device *rd)
-{
-  struct player_command *cmd;
-  int ret;
-
-  cmd = (struct player_command *)malloc(sizeof(struct player_command));
-  if (!cmd)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not allocate player_command\n");
-
-      device_free(rd);
-      return;
-    }
-
-  memset(cmd, 0, sizeof(struct player_command));
-
-  cmd->nonblock = 1;
-
-  cmd->func = device_remove_family;
-  cmd->arg.rd = rd;
-
-  ret = nonblock_command(cmd);
-  if (ret < 0)
-    {
-      free(cmd);
-      device_free(rd);
-
-      return;
-    }
-}
-
-
-/* RAOP devices discovery - mDNS callback */
-/* Thread: main (mdns) */
-static void
-raop_device_cb(const char *name, const char *type, const char *domain, const char *hostname, int family, const char *address, int port, struct keyval *txt)
-{
-  struct raop_device *rd;
-  cfg_t *apex;
-  const char *p;
-  char *at_name;
-  char *password;
-  uint64_t id;
-  char has_password;
-  enum raop_devtype devtype;
-  int ret;
-
-  ret = safe_hextou64(name, &id);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not extract AirTunes device ID (%s)\n", name);
-
-      return;
-    }
-
-  at_name = strchr(name, '@');
-  if (!at_name)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not extract AirTunes device name (%s)\n", name);
-
-      return;
-    }
-  at_name++;
-
-  DPRINTF(E_DBG, L_PLAYER, "Event for AirTunes device %" PRIx64 "/%s (%d)\n", id, at_name, port);
-
-  rd = (struct raop_device *)malloc(sizeof(struct raop_device));
-  if (!rd)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Out of memory for new AirTunes device\n");
-
-      return;
-    }
-
-  memset(rd, 0, sizeof(struct raop_device));
-
-  rd->id = id;
-  rd->name = strdup(at_name);
-
-  if (port < 0)
-    {
-      /* Device stopped advertising */
-      switch (family)
-	{
-	  case AF_INET:
-	    rd->v4_port = 1;
-	    break;
-
-	  case AF_INET6:
-	    rd->v6_port = 1;
-	    break;
-	}
-
-      player_device_remove(rd);
-
-      return;
-    }
-
-  p = keyval_get(txt, "tp");
-  if (!p)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: no tp field in TXT record!\n", name);
-
-      goto free_rd;
-    }
-
-  if (*p == '\0')
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: tp has no value\n", name);
-
-      goto free_rd;
-    }
-
-  if (!strstr(p, "UDP"))
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: device does not support AirTunes v2 (tp=%s), discarding\n", name, p);
-
-      goto free_rd;
-    }
-
-  password = NULL;
-  p = keyval_get(txt, "pw");
-  if (!p)
-    { 
-      DPRINTF(E_INFO, L_PLAYER, "AirTunes %s: no pw field in TXT record, assuming no password protection\n", name);
-      has_password = 0;
-    }
-  else if (*p == '\0')
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: pw has no value\n", name);
-
-      goto free_rd;
-    }
-  else
-    {
-      has_password = (strcmp(p, "false") != 0);
-    }
-
-  if (has_password)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes device %s is password-protected\n", name);
-
-      apex = cfg_gettsec(cfg, "apex", at_name);
-      if (apex)
-	password = cfg_getstr(apex, "password");
-
-      if (!password)
-	DPRINTF(E_LOG, L_PLAYER, "No password given in config for AirTunes device %s\n", name);
-    }
-
-  devtype = RAOP_DEV_APEX_80211N;
-
-  p = keyval_get(txt, "am");
-  if (!p)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: no am field in TXT record!\n", name);
-
-      /* Old AirPort Express */
-      devtype = RAOP_DEV_APEX_80211G;
-
-      goto no_am;
-    }
-
-  if (*p == '\0')
-    {
-      DPRINTF(E_LOG, L_PLAYER, "AirTunes %s: am has no value\n", name);
-
-      goto no_am;
-    }
-
-  if (strncmp(p, "AppleTV", strlen("AppleTV")) == 0)
-    devtype = RAOP_DEV_APPLETV;
-  else if (strncmp(p, "AirPort4", strlen("AirPort4")) != 0)
-    devtype = OTHER;
-
- no_am:
-  DPRINTF(E_DBG, L_PLAYER, "AirTunes device %s: password: %s, type %s\n", name, (password) ? "yes" : "no", raop_devtype[devtype]);
-
-  rd->advertised = 1;
-
-  switch (family)
-    {
-      case AF_INET:
-	rd->v4_address = strdup(address);
-	rd->v4_port = port;
-	break;
-
-      case AF_INET6:
-	rd->v6_address = strdup(address);
-	rd->v6_port = port;
-	break;
-    }
-
-  rd->devtype = devtype;
-
-  rd->has_password = has_password;
-  rd->password = password;
-
-  player_device_add(rd);
-
-  return;
-
- free_rd:
-  device_free(rd);
-}
-
 /* Thread: player */
 static void *
 player(void *arg)
 {
-  struct raop_device *rd;
+  struct output_device *device;
   int ret;
 
   ret = db_perthread_init();
@@ -3800,15 +4300,11 @@ player(void *arg)
   /* Save selected devices */
   db_speaker_clear_all();
 
-  ret = db_speaker_save(0, laudio_selected, laudio_volume);
-  if (ret < 0)
-    DPRINTF(E_LOG, L_PLAYER, "Could not save state for local audio\n");
-
-  for (rd = dev_list; rd; rd = rd->next)
+  for (device = dev_list; device; device = device->next)
     {
-      ret = db_speaker_save(rd->id, rd->selected, rd->volume);
+      ret = db_speaker_save(device->id, device->selected, device->volume, device->name);
       if (ret < 0)
-	DPRINTF(E_LOG, L_PLAYER, "Could not save state for speaker %s\n", rd->name);
+	DPRINTF(E_LOG, L_PLAYER, "Could not save state for %s device '%s'\n", device->type_name, device->name);
     }
 
   db_perthread_deinit();
@@ -3829,91 +4325,101 @@ exit_cb(int fd, short what, void *arg)
 int
 player_init(void)
 {
+  uint64_t interval;
   uint32_t rnd;
-  int raop_v6enabled;
-  int mdns_flags;
   int ret;
 
   player_exit = 0;
 
-  dev_autoselect = 1;
+  clear_queue_on_stop_disabled = cfg_getbool(cfg_getsec(cfg, "mpd"), "clear_queue_on_stop_disable");
+
   dev_list = NULL;
 
   master_volume = -1;
-  laudio_enabled = 0;
 
-//  laudio_enabled = cfg_getbool(cfg_getsec(cfg, "general"), "laudio_enable");
-//  laudio_enabled = 1;
-  laudio_selected = 0;
-  laudio_status = LAUDIO_CLOSED;
-  raop_sessions = 0;
+  output_sessions = 0;
 
   cur_cmd = NULL;
 
-  pb_timer_fd = -1;
-
-  source_head = NULL;
-  shuffle_head = NULL;
   cur_playing = NULL;
   cur_streaming = NULL;
   cur_plid = 0;
+  cur_plversion = 0;
 
   player_state = PLAY_STOPPED;
   repeat = REPEAT_OFF;
   shuffle = 0;
 
-  update_handler = NULL;
+  queue = queue_new();
+  history = (struct player_history *)calloc(1, sizeof(struct player_history));
 
-  /* Random RTP time start */
+  /*
+   * Determine if the resolution of the system timer is > or < the size
+   * of an audio packet. NOTE: this assumes the system clock resolution
+   * is less than one second.
+   */
+  if (clock_getres(CLOCK_MONOTONIC, &timer_res) < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not get the system timer resolution.\n");
+
+      return -1;
+    }
+
+#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+  /* FreeBSD will report a resolution of 1, but actually has a resolution
+   * larger than an audio packet
+   */
+  if (timer_res.tv_nsec == 1)
+    timer_res.tv_nsec = 2 * AIRTUNES_V2_STREAM_PERIOD;
+#endif
+
+  // Set the tick interval for the playback timer
+  interval = MAX(timer_res.tv_nsec, AIRTUNES_V2_STREAM_PERIOD);
+  tick_interval.tv_nsec = interval;
+
+  // Create the playback timer
+#if defined(__linux__)
+  pb_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+  ret = pb_timer_fd;
+#else
+  ret = timer_create(CLOCK_MONOTONIC, NULL, &pb_timer);
+#endif
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not create playback timer: %s\n", strerror(errno));
+
+      return -1;
+    }
+
+  // Random RTP time start
   gcry_randomize(&rnd, sizeof(rnd), GCRY_STRONG_RANDOM);
   last_rtptime = ((uint64_t)1 << 32) | rnd;
-
-  rng_init(&shuffle_rng);
-
-  ret = db_speaker_get(0, &laudio_selected, &laudio_volume);
-  if (ret < 0)
-    laudio_volume = 75;
-  else if (laudio_selected)
-    speaker_select_laudio(); /* Run the select helper */
 
   audio_buf = evbuffer_new();
   if (!audio_buf)
     {
       DPRINTF(E_LOG, L_PLAYER, "Could not allocate evbuffer for audio buffer\n");
 
-      return -1;
+      goto audio_fail;
     }
 
-  raop_v6enabled = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6");
-
-
-#ifdef USE_EVENTFD
-  exit_efd = eventfd(0, EFD_CLOEXEC);
-  if (exit_efd < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not create eventfd: %s\n", strerror(errno));
-
-      goto exit_fail;
-    }
-#else
-# if defined(__linux__)
+#ifdef HAVE_PIPE2
   ret = pipe2(exit_pipe, O_CLOEXEC);
-# else
+#else
   ret = pipe(exit_pipe);
-# endif
+#endif
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_PLAYER, "Could not create pipe: %s\n", strerror(errno));
 
       goto exit_fail;
     }
-#endif /* USE_EVENTFD */
 
-# if defined(__linux__)
+#ifdef HAVE_PIPE2
   ret = pipe2(cmd_pipe, O_CLOEXEC);
-# else
+#else
   ret = pipe(cmd_pipe);
-# endif
+#endif
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_PLAYER, "Could not create command pipe: %s\n", strerror(errno));
@@ -3929,76 +4435,75 @@ player_init(void)
       goto evbase_fail;
     }
 
-#ifdef USE_EVENTFD
-  event_set(&exitev, exit_efd, EV_READ, exit_cb, NULL);
+  exitev = event_new(evbase_player, exit_pipe[0], EV_READ, exit_cb, NULL);
+  if (!exitev)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not create exit event\n");
+      goto evnew_fail;
+    }
+
+  cmdev = event_new(evbase_player, cmd_pipe[0], EV_READ, command_cb, NULL);
+  if (!cmdev)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "Could not create cmd event\n");
+      goto evnew_fail;
+    }
+
+#if defined(__linux__)
+  pb_timer_ev = event_new(evbase_player, pb_timer_fd, EV_READ | EV_PERSIST, player_playback_cb, NULL);
 #else
-  event_set(&exitev, exit_pipe[0], EV_READ, exit_cb, NULL);
+  pb_timer_ev = event_new(evbase_player, SIGALRM, EV_SIGNAL | EV_PERSIST, player_playback_cb, NULL);
 #endif
-  event_base_set(evbase_player, &exitev);
-  event_add(&exitev, NULL);
-
-  event_set(&cmdev, cmd_pipe[0], EV_READ, command_cb, NULL);
-  event_base_set(evbase_player, &cmdev);
-  event_add(&cmdev, NULL);
-
-  ret = laudio_init(player_laudio_status_cb);
-  if (ret < 0)
+  if (!pb_timer_ev)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Local audio init failed\n");
-
-      goto laudio_fail;
+      DPRINTF(E_LOG, L_PLAYER, "Could not create playback timer event\n");
+      goto evnew_fail;
     }
 
-  ret = raop_init(&raop_v6enabled);
+  event_add(exitev, NULL);
+  event_add(cmdev, NULL);
+  event_add(pb_timer_ev, NULL);
+
+  ret = outputs_init();
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_PLAYER, "RAOP init failed\n");
-
-      goto raop_fail;
-    }
-
-  if (raop_v6enabled)
-    mdns_flags = MDNS_WANT_V4 | MDNS_WANT_V6 | MDNS_WANT_V6LL;
-  else
-    mdns_flags = MDNS_WANT_V4;
-
-  ret = mdns_browse("_raop._tcp", mdns_flags, raop_device_cb);
-  if (ret < 0)
-    {
-      DPRINTF(E_FATAL, L_PLAYER, "Could not add mDNS browser for AirTunes devices\n");
-
-      goto mdns_browse_fail;
+      DPRINTF(E_FATAL, L_PLAYER, "Output initiation failed\n");
+      goto outputs_fail;
     }
 
   ret = pthread_create(&tid_player, NULL, player, NULL);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
-
+      DPRINTF(E_FATAL, L_PLAYER, "Could not spawn player thread: %s\n", strerror(errno));
       goto thread_fail;
     }
+#if defined(HAVE_PTHREAD_SETNAME_NP)
+  pthread_setname_np(tid_player, "player");
+#elif defined(HAVE_PTHREAD_SET_NAME_NP)
+  pthread_set_name_np(tid_player, "player");
+#endif
 
   return 0;
 
  thread_fail:
- mdns_browse_fail:
-  raop_deinit();
- raop_fail:
-  laudio_deinit();
- laudio_fail:
+  outputs_deinit();
+ outputs_fail:
+ evnew_fail:
   event_base_free(evbase_player);
  evbase_fail:
   close(cmd_pipe[0]);
   close(cmd_pipe[1]);
  cmd_fail:
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
   close(exit_pipe[0]);
   close(exit_pipe[1]);
-#endif
  exit_fail:
   evbuffer_free(audio_buf);
+ audio_fail:
+#if defined(__linux__)
+  close(pb_timer_fd);
+#else
+  timer_delete(pb_timer);
+#endif
 
   return -1;
 }
@@ -4008,26 +4513,15 @@ void
 player_deinit(void)
 {
   int ret;
-
-#ifdef USE_EVENTFD
-  ret = eventfd_write(exit_efd, 1);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_PLAYER, "Could not send exit event: %s\n", strerror(errno));
-
-      return;
-    }
-#else
   int dummy = 42;
 
   ret = write(exit_pipe[1], &dummy, sizeof(dummy));
   if (ret != sizeof(dummy))
     {
-      DPRINTF(E_LOG, L_PLAYER, "Could not write to exit fd: %s\n", strerror(errno));
+      DPRINTF(E_LOG, L_PLAYER, "Could not write to exit pipe: %s\n", strerror(errno));
 
       return;
     }
-#endif
 
   ret = pthread_join(tid_player, NULL);
   if (ret != 0)
@@ -4037,25 +4531,22 @@ player_deinit(void)
       return;
     }
 
-  if (source_head)
-    queue_clear(NULL);
+  queue_free(queue);
+  free(history);
+
+  pb_timer_stop();
+#if defined(__linux__)
+  close(pb_timer_fd);
+#else
+  timer_delete(pb_timer);
+#endif
 
   evbuffer_free(audio_buf);
 
-  laudio_deinit();
-  raop_deinit();
+  outputs_deinit();
 
-  if (event_initialized(&pb_timer_ev))
-    event_del(&pb_timer_ev);
-
-  event_del(&cmdev);
-
-#ifdef USE_EVENTFD
-  close(exit_efd);
-#else
   close(exit_pipe[0]);
   close(exit_pipe[1]);
-#endif
   close(cmd_pipe[0]);
   close(cmd_pipe[1]);
   cmd_pipe[0] = -1;
